@@ -1,8 +1,10 @@
 ---
-title: "SPPH604: Statistical Analysis Plan Analytic Code"
+title: 'SPPH604: Statistical Analysis Plan Analytic Code'
 author: "Teal Green (Alexi, Alex, Ezra)"
 date: "2025-09-25"
-output: pdf_document
+output:
+  word_document: default
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -203,9 +205,54 @@ missingness_summary <- function(d) {
 nhanes_get <- function(table_base, suffix, quiet = FALSE) {
   nm <- paste0(table_base, suffix)
   if (!quiet) message("Downloading ", nm, " ...")
-  out <- tryCatch(nhanesA::nhanes(nm), error = function(e) NULL)
+  out <- tryCatch(
+    suppressWarnings(nhanesA::nhanes(nm)),
+    error = function(e) NULL
+  )
   if (is.null(out)) return(NULL)
   out %>% janitor::clean_names() %>% haven::zap_labels()
+}
+
+# Safe pull: always returns at least SEQN, lowercased; keeps it simple
+safe_get <- function(base, suf) {
+  df <- nhanes_get(base, suf, quiet = TRUE)
+  if (is.null(df)) return(tibble(seqn = integer()))
+  df <- janitor::clean_names(df)
+  if (!"seqn" %in% names(df)) df$seqn <- NA
+  dplyr::mutate(df, seqn = as.integer(seqn))
+}
+
+# Yes = 1; everything else (No/Refused/DK/Missing or not-asked) = 0
+yes1_else0 <- function(x) {
+  xs <- trimws(as.character(x))
+  xs[xs %in% c("", ".", "..", "...")] <- NA_character_
+  xn <- suppressWarnings(as.numeric(xs))
+  out <- ifelse(!is.na(xn), ifelse(xn == 1, 1L, 0L),
+                ifelse(grepl("^YES$", toupper(xs)), 1L, 0L))
+  out[is.na(out)] <- 0L
+  as.integer(out)
+}
+
+# If the HIQ recoder wasn't defined earlier, define a simple one here
+if (!exists("recode_hiq011_yesno")) {
+  recode_hiq011_yesno <- function(x) {
+    xs <- trimws(as.character(x))
+    xs[xs %in% c("", ".", "..", "...")] <- NA_character_
+    lead_num <- suppressWarnings(as.numeric(stringr::str_extract(xs, "^[0-9]+")))
+    out_num <- dplyr::case_when(
+      !is.na(lead_num) & lead_num == 1 ~ 1L,
+      !is.na(lead_num) & lead_num == 2 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+    need_fallback <- is.na(out_num) & !is.na(xs)
+    xs_up <- toupper(xs)
+    out_fallback <- dplyr::case_when(
+      stringr::str_detect(xs_up, "\\bYES\\b|\\bCOVERED\\b")       ~ 1L,
+      stringr::str_detect(xs_up, "\\bNO\\b|\\bNOT\\s+COVERED\\b") ~ 0L,
+      TRUE ~ NA_integer_
+    )
+    ifelse(need_fallback, out_fallback, out_num)
+  }
 }
 ```
 
@@ -223,10 +270,11 @@ demo_all <- purrr::map_dfr(cycle_meta$suffix, ~{
 })
 stopifnot(nrow(demo_all) > 0)
 
-#RX: Polypharmacy counts with true zeros 
-demo_roster <- demo_all %>% transmute(seqn = as.integer(seqn)) %>% distinct()
+# Roster = one row per participant
+demo_roster <- demo_all %>% dplyr::transmute(seqn = as.integer(seqn)) %>% dplyr::distinct()
 
-# Tables that contain RXDCOUNT directly (by cycle)
+# ---- RX: Polypharmacy counts with true zeros
+# Official RXDCOUNT tables by cycle
 rx_tables <- tryCatch(
   nhanesA::nhanesSearchVarName(varname = "RXDCOUNT", ystart = 2003, ystop = 2018, namesonly = TRUE),
   error = function(e) character(0)
@@ -234,24 +282,24 @@ rx_tables <- tryCatch(
 stopifnot(length(rx_tables) > 0)
 
 rx_official <- purrr::map_dfr(rx_tables, function(tbl) {
-  df <- tryCatch(nhanesA::nhanes(tbl), error = function(e) NULL)
+  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
   if (is.null(df)) return(tibble())
   df %>%
     janitor::clean_names() %>%
-    transmute(seqn = as.integer(seqn),
-              rxdcount = suppressWarnings(as.numeric(rxdcount))) %>%
-    group_by(seqn) %>%
-    summarise(rxdcount = dplyr::coalesce(dplyr::first(na.omit(rxdcount)), NA_real_), .groups = "drop")
+    dplyr::transmute(seqn = as.integer(seqn),
+                     rxdcount = suppressWarnings(as.numeric(rxdcount))) %>%
+    dplyr::group_by(seqn) %>%
+    dplyr::summarise(rxdcount = dplyr::coalesce(dplyr::first(na.omit(rxdcount)), NA_real_), .groups = "drop")
 })
 
-# Fallback: count only valid medication rows in RXQ_RX*
+# Fallback: count only valid medication rows in RXQ_RX* (ignore header-only rows)
 rx_alt <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
   tbl <- paste0("RXQ_RX", suf)
-  df <- tryCatch(nhanesA::nhanes(tbl), error = function(e) NULL)
+  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
   if (is.null(df)) return(tibble())
   df <- janitor::clean_names(df)
   df %>%
-    mutate(
+    dplyr::mutate(
       seqn         = as.integer(seqn),
       rxduse_n     = suppressWarnings(as.numeric(rxduse)),
       rxddrgid_n   = suppressWarnings(as.numeric(rxddrgid)),
@@ -259,52 +307,72 @@ rx_alt <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
       has_drugname = !is.na(rxddrug) & nzchar(trimws(rxddrug)),
       med_row      = (rxduse_n == 1) & (has_drugcode | has_drugname)
     ) %>%
-    group_by(seqn) %>%
-    summarise(rxdcount_alt = sum(med_row, na.rm = TRUE), .groups = "drop")
+    dplyr::group_by(seqn) %>%
+    dplyr::summarise(rxdcount_alt = sum(med_row, na.rm = TRUE), .groups = "drop")
 })
 
 # Final RX dataset (prefer official; else fallback; else 0)
 rx_all <- demo_roster %>%
-  left_join(rx_official, by = "seqn") %>%
-  left_join(rx_alt,      by = "seqn") %>%
-  mutate(rxdcount = coalesce(as.numeric(rxdcount), as.numeric(rxdcount_alt), 0)) %>%
-  select(seqn, rxdcount)
-# table(rx_all$rxdcount == 0)
-  
-# MCQ: comorbidity items (Yes=1, else 0; sum across items) 
-# Requested variables (case-insensitive)
-mcq_keep <- tolower(c(
-  "SEQN",
-  "MCQ010",
-  "MCQ160A","MCQ160N","MCQ160B","MCQ160C","MCQ160D","MCQ160E","MCQ160F",
-  "MCQ160M","MCQ160G","MCQ160K","MCQ160O",
-  "MCA160L",   # included as given
-  "MCQ550","MCQ203","MCQ220"
-))
-# angina pectoris, arthritis, asthma, chronic bronchitis, congestive heart failure, coronary heart disease, diabetes, emphysema, gout, hypertension, liver condition, myocardial infarction, obesity, stroke, thyroid problems, and kidney disease
+  dplyr::left_join(rx_official, by = "seqn") %>%
+  dplyr::left_join(rx_alt,      by = "seqn") %>%
+  dplyr::mutate(rxdcount = dplyr::coalesce(as.numeric(rxdcount), as.numeric(rxdcount_alt), 0)) %>%
+  dplyr::select(seqn, rxdcount)
 
-mcq_all <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- nhanes_get("MCQ", .x, quiet = TRUE); if (is.null(df)) return(tibble())
-  df <- janitor::clean_names(df)
-  have <- intersect(names(df), mcq_keep)
-  if (!length(have)) return(tibble(seqn = as.integer(df$seqn)))
-  df %>%
-    select(all_of(have)) %>%
-    mutate(seqn = as.integer(seqn))
+# Comorbidities: MCQ + DIQ010 + BPQ020 + KIQ022
+# Target item names after clean_names() (all lower case)
+comorb_vars <- c(
+  # MCQ (ever told …)
+  "mcq010","mcq080","mcq160a","mcq160n","mcq160b","mcq160c","mcq160d",
+  "mcq160e","mcq160f","mcq160m","mcq160g","mcq160k","mcq160l","mcq220",
+  # Other modules
+  "diq010",  # diabetes
+  "bpq020",  # hypertension
+  "kiq022"   # kidney disease
+)
+# Include 16 conditions: angina pectoris, arthritis, asthma, chronic bronchitis, congestive heart failure, coronary heart disease, diabetes, emphysema, gout, hypertension, liver condition, myocardial infarction, obesity, stroke, thyroid problems, and kidney disease
+
+# Pull each module across cycles (quiet)
+mcq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
+  df <- safe_get("MCQ", .x)
+  keep <- intersect(names(df), c("seqn", comorb_vars))
+  dplyr::select(df, dplyr::all_of(keep))
 })
 
-# Recode to 1/0 (1/Yes=1; No/Refused/DK/Missing=0) and sum
-if (nrow(mcq_all) > 0) {
-  mcq_item_names <- setdiff(names(mcq_all), "seqn")
-  mcq_clean <- mcq_all %>%
-    mutate(across(all_of(mcq_item_names), mcq_yes1_else0)) %>%
-    mutate(comorbidity_n = rowSums(across(all_of(mcq_item_names)), na.rm = TRUE)) %>%
-    select(seqn, comorbidity_n)
-} else {
-  mcq_clean <- tibble(seqn = integer(), comorbidity_n = integer())
+diq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
+  df <- safe_get("DIQ", .x)
+  if ("diq010" %in% names(df)) dplyr::select(df, seqn, diq010) else tibble(seqn = df$seqn)
+})
+
+bpq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
+  df <- safe_get("BPQ", .x)
+  if ("bpq020" %in% names(df)) dplyr::select(df, seqn, bpq020) else tibble(seqn = df$seqn)
+})
+
+kiq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
+  df <- safe_get("KIQ", .x)
+  if ("kiq022" %in% names(df)) dplyr::select(df, seqn, kiq022) else tibble(seqn = df$seqn)
+})
+
+# Start from roster to keep everyone; left-join modules
+health_wide <- demo_roster %>%
+  dplyr::left_join(mcq_wide, by = "seqn") %>%
+  dplyr::left_join(diq_wide, by = "seqn") %>%
+  dplyr::left_join(bpq_wide, by = "seqn") %>%
+  dplyr::left_join(kiq_wide, by = "seqn")
+
+# Ensure all comorbidity columns exist; create if missing (as NA -> will be coded 0)
+for (v in comorb_vars) {
+  if (!v %in% names(health_wide)) health_wide[[v]] <- NA
 }
 
-# HIQ: insurance (Yes/No/Unknown) 
+# Recode to 1/0 and sum across items
+mcq_clean <- health_wide %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(comorb_vars), yes1_else0)) %>%
+  dplyr::mutate(comorbidity_n = rowSums(dplyr::across(dplyr::all_of(comorb_vars)), na.rm = TRUE)) %>%
+  dplyr::select(seqn, comorbidity_n)
+
+# Insurance: HIQ011 -> Yes/No/Unknown
+
 hiq_all <- purrr::map_dfr(cycle_meta$suffix, ~{
   df <- nhanes_get("HIQ", .x, quiet = TRUE); if (is.null(df)) return(tibble())
   df <- janitor::clean_names(df)
@@ -315,16 +383,16 @@ hiq_all <- purrr::map_dfr(cycle_meta$suffix, ~{
     hiq011_raw = if (length(cand)) as.character(df[[cand[1]]]) else NA_character_
   )
 }) %>%
-  mutate(
+  dplyr::mutate(
     yn = recode_hiq011_yesno(hiq011_raw),
-    insured = case_when(
+    insured = dplyr::case_when(
       yn == 1L ~ "Yes",
       yn == 0L ~ "No",
       TRUE     ~ "Unknown"
     ),
     insured = factor(insured, levels = c("No","Yes","Unknown"))
   ) %>%
-  select(seqn, insured)
+  dplyr::select(seqn, insured)
 ```
 
 ## Merge, inclusion criteria (age ≥ 45), construct exposure + covariates
@@ -358,6 +426,12 @@ df45 <- raw %>%
     ) %>% factor(levels = c("0","1–4","5–9","≥10")),
 
     # core demo + SES
+    age_cat = case_when(
+      ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+      ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+      ridageyr >= 80 ~ "80 or above"
+    ) %>% factor(levels = c("45-64", "65-79", "80 or above")),
+    
     sex       = recode_sex(riagendr),
     race_eth  = derive_race_eth(cur_data()),
     ed_cat    = derive_ed_cat(dmdeduc2),
@@ -386,8 +460,7 @@ analytic <- df45 %>%
   filter(!is.na(time_y), event %in% c(0,1)) %>%
   transmute(
     seqn, sddsrvyr,
-    age_years = ridageyr,
-    sex, race_eth, ed_cat,
+    age_cat, sex, race_eth, ed_cat,
     indfmpir, indfmpir_cat,
     insured,
     rxdcount, poly_cat,
@@ -398,7 +471,7 @@ analytic <- df45 %>%
   )
 
 # Create complete-case set for models (uses categorical indfmpir_cat)
-model_vars <- c("age_years","sex","race_eth","ed_cat","indfmpir_cat",
+model_vars <- c("age_cat","sex","race_eth","ed_cat","indfmpir_cat",
                 "insured","poly_cat","comorbidity_n","time_y","event","sddsrvyr")
 
 analytic_final <- analytic %>%
@@ -415,7 +488,7 @@ dsgn <- svydesign(
 )
 
 # Quick audit
-print(missingness_summary(analytic %>% select(age_years, sex, race_eth, ed_cat, indfmpir, indfmpir_cat,
+print(missingness_summary(analytic %>% select(age_cat, sex, race_eth, ed_cat, indfmpir, indfmpir_cat,
                                              insured, rxdcount, poly_cat, comorbidity_n, time_y, event)))
 ```
 
@@ -427,11 +500,11 @@ tbl1_by_outcome <- gtsummary::tbl_summary(
   by = event_f,
   include = c(
     poly_cat,              
-    rxdcount, age_years, sex, race_eth, ed_cat, indfmpir_cat, insured,
+    rxdcount, age_cat, sex, race_eth, ed_cat, indfmpir_cat, insured,
     comorbidity_n
   ),
   label = list(
-    age_years     ~ "Age",
+    age_cat     ~ "Age group",
     sex           ~ "Sex",
     race_eth      ~ "Race/ethnicity",
     ed_cat        ~ "Education",
@@ -455,11 +528,11 @@ tbl1_by_exposure <- gtsummary::tbl_summary(
   data = analytic_final,
   by = poly_cat,
   include = c(
-    age_years, sex, race_eth, ed_cat, indfmpir_cat, insured,
+    age_cat, sex, race_eth, ed_cat, indfmpir_cat, insured,
     rxdcount, comorbidity_n, event_f
   ),
   label = list(
-    age_years     ~ "Age",
+    age_cat     ~ "Age group",
     sex           ~ "Sex",
     race_eth      ~ "Race/ethnicity",
     ed_cat        ~ "Education",
@@ -487,13 +560,13 @@ m_crude_svy <- svycoxph(Surv(time_y, event) ~ poly_cat, design = dsgn)
 
 # Basic (add demographics)
 m_basic_svy <- svycoxph(
-  Surv(time_y, event) ~ poly_cat + age_years + sex + race_eth,
+  Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth,
   design = dsgn
 )
 
 # Full planned model
 m_full_svy <- svycoxph(
-  Surv(time_y, event) ~ poly_cat + age_years + sex + race_eth +
+  Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
     ed_cat + indfmpir_cat + insured + comorbidity_n,
   design = dsgn
 )
@@ -505,14 +578,14 @@ labels_crude <- list(
 
 labels_basic <- list(
   poly_cat  ~ "Polypharmacy",
-  age_years ~ "Age",
+  age_cat ~ "Age group",
   sex       ~ "Sex",
   race_eth  ~ "Race/ethnicity"
 )
 
 labels_full <- list(
   poly_cat      ~ "Polypharmacy",
-  age_years     ~ "Age",
+  age_cat     ~ "Age group",
   sex           ~ "Sex",
   race_eth      ~ "Race/ethnicity",
   ed_cat        ~ "Education",
@@ -551,7 +624,7 @@ models_merged
 # We fit the full covariate set, replacing poly_cat with ns(rxdcount, knots=c(5,10))
 m_spline_svy <- svycoxph(
   Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5, 10)) +
-    age_years + sex + race_eth + ed_cat + indfmpir_cat + insured + comorbidity_n,
+    age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured + comorbidity_n,
   design = dsgn
 )
 
@@ -565,7 +638,7 @@ print(glob_test)
 Mode <- function(x) names(sort(table(x), decreasing = TRUE))[1]
 
 ref_row <- tibble::tibble(
-  age_years     = median(analytic_final$age_years, na.rm = TRUE),
+  age_cat     = factor(Mode(analytic_final$age_cat), levels = levels(analytic_final$age_cat)),
   sex           = factor(Mode(analytic_final$sex), levels = levels(analytic_final$sex)),
   race_eth      = factor(Mode(analytic_final$race_eth), levels = levels(analytic_final$race_eth)),
   ed_cat        = factor(Mode(analytic_final$ed_cat), levels = levels(analytic_final$ed_cat)),
@@ -657,7 +730,7 @@ print(hr_table)
 # gtsummary model table with clear labels and a global p-value for the spline term
 nice_labels <- list(
   `splines::ns(rxdcount, knots = c(5, 10))` ~ "Medication count (spline; knots 5 & 10)",
-  age_years     ~ "Age",
+  age_cat     ~ "Age group",
   sex           ~ "Sex",
   race_eth      ~ "Race/ethnicity",
   ed_cat        ~ "Education",
