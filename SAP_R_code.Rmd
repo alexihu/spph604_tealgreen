@@ -349,7 +349,7 @@ bpq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
 })
 
 kiq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- safe_get("KIQ", .x)
+  df <- safe_get("KIQ_U", .x)
   if ("kiq022" %in% names(df)) dplyr::select(df, seqn, kiq022) else tibble(seqn = df$seqn)
 })
 
@@ -511,7 +511,7 @@ tbl1_by_outcome <- gtsummary::tbl_summary(
     indfmpir_cat  ~ "Income-to-poverty ratio",
     insured       ~ "Insurance coverage",
     rxdcount      ~ "Medication count",
-    comorbidity_n ~ "Number of comorbidity",
+    comorbidity_n ~ "Number of comorbidities",
     poly_cat      ~ "Polypharmarcy"
   ),
   statistic = list(
@@ -539,7 +539,7 @@ tbl1_by_exposure <- gtsummary::tbl_summary(
     indfmpir_cat  ~ "Income-to-poverty ratio",
     insured       ~ "Insurance coverage",
     rxdcount      ~ "Medication count",
-    comorbidity_n ~ "Number of comorbidity",
+    comorbidity_n ~ "Number of comorbidities",
     event_f       ~ "Mortality prevalence"
   ),
   statistic = list(
@@ -736,7 +736,7 @@ nice_labels <- list(
   ed_cat        ~ "Education",
   indfmpir_cat  ~ "Income-to-poverty ratio",
   insured       ~ "Insurance coverage",
-  comorbidity_n ~ "Number of comorbidity"
+  comorbidity_n ~ "Number of comorbidities"
 )
 
 spline_tbl <- gtsummary::tbl_regression(
