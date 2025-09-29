@@ -1,10 +1,13 @@
 ---
 title: 'SPPH604: Statistical Analysis Plan Analytic Code'
 author: "Teal Green (Alexi, Alex, Ezra)"
-date: "2025-09-25"
+date: "2025-09-28"
 output:
   word_document: default
-  pdf_document: default
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
@@ -15,7 +18,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 This is an R Markdown document of the reproducible code for the statistical analysis plan from Teal Green for SPPH604.
 
-Our research question is: Among U.S. adults aged 45 years or above in NHANES 2003–2018, are levels of polypharmacy associated with all-cause mortality and cardiovascular disease mortality?
+Our research question is: Among U.S. adults aged 45 years or above in NHANES 2003–2018, are levels of polypharmacy associated with all-cause mortality?
 
 PICOT Elements
 
@@ -25,11 +28,11 @@ PICOT Elements
 
 **Comparator (C)**: No polypharmacy (0)
 
-**Outcome (O)**: Risk of all-cause and cardiovascular disease mortality Time from NHANES interview to all-cause and cardiovascular disease death or censoring at the end of follow-up
+**Outcome (O)**: Risk of all-cause mortality time from NHANES interview to all-cause death or censoring at the end of follow-up
 
 **Timeframe (T)**: Up to 15 years of follow-up through NHANES-linked mortality files.
 
-**Confounders**: sex RIAGENDR, race/ethnicity RIDRETH1/ RIDRETH3, age RIDAGEYR, survey cycle indicator SDDSRVYR, education DMDEDUC2, income-to-poverty ratio INDFMPIR, MCQ (comorbidity count/index), insurance HIQ011, Affordable Care Act (policy change in 2014)
+**Confounders**: sex RIAGENDR, race/ethnicity RIDRETH1/ RIDRETH3, age RIDAGEYR, survey cycle indicator SDDSRVYR, education DMDEDUC2, income-to-poverty ratio INDFMPIR, MCQ (comorbidity count/index), insurance HIQ011
 
 ### Load packages and define NHANES cycles
 
@@ -103,7 +106,6 @@ nhanes_mortality <- purrr::map_dfr(files, read_one) %>%
   dplyr::filter(eligstat == 1)
 
 # Quick peek
-head(nhanes_mortality)
 glimpse(nhanes_mortality)
 ```
 
@@ -124,7 +126,7 @@ recode_sex <- function(x) {
   factor(out, levels = c("Male","Female"))
 }
 
-# Race/ethnicity; prefer RIDRETH3 when present (2011–18)
+# Race/ethnicity; use RIDRETH3 when present (2011–18)
 derive_race_eth <- function(df) {
   ridreth1 <- suppressWarnings(as.numeric(df$ridreth1))
   ridreth3 <- suppressWarnings(as.numeric(df$ridreth3))
@@ -213,7 +215,7 @@ nhanes_get <- function(table_base, suffix, quiet = FALSE) {
   out %>% janitor::clean_names() %>% haven::zap_labels()
 }
 
-# Safe pull: always returns at least SEQN, lowercased; keeps it simple
+# Safe pull: always returns at least SEQN, lowercased
 safe_get <- function(base, suf) {
   df <- nhanes_get(base, suf, quiet = TRUE)
   if (is.null(df)) return(tibble(seqn = integer()))
@@ -231,28 +233,6 @@ yes1_else0 <- function(x) {
                 ifelse(grepl("^YES$", toupper(xs)), 1L, 0L))
   out[is.na(out)] <- 0L
   as.integer(out)
-}
-
-# If the HIQ recoder wasn't defined earlier, define a simple one here
-if (!exists("recode_hiq011_yesno")) {
-  recode_hiq011_yesno <- function(x) {
-    xs <- trimws(as.character(x))
-    xs[xs %in% c("", ".", "..", "...")] <- NA_character_
-    lead_num <- suppressWarnings(as.numeric(stringr::str_extract(xs, "^[0-9]+")))
-    out_num <- dplyr::case_when(
-      !is.na(lead_num) & lead_num == 1 ~ 1L,
-      !is.na(lead_num) & lead_num == 2 ~ 0L,
-      TRUE ~ NA_integer_
-    )
-    need_fallback <- is.na(out_num) & !is.na(xs)
-    xs_up <- toupper(xs)
-    out_fallback <- dplyr::case_when(
-      stringr::str_detect(xs_up, "\\bYES\\b|\\bCOVERED\\b")       ~ 1L,
-      stringr::str_detect(xs_up, "\\bNO\\b|\\bNOT\\s+COVERED\\b") ~ 0L,
-      TRUE ~ NA_integer_
-    )
-    ifelse(need_fallback, out_fallback, out_num)
-  }
 }
 ```
 
@@ -273,7 +253,7 @@ stopifnot(nrow(demo_all) > 0)
 # Roster = one row per participant
 demo_roster <- demo_all %>% dplyr::transmute(seqn = as.integer(seqn)) %>% dplyr::distinct()
 
-# ---- RX: Polypharmacy counts with true zeros
+# RX: Polypharmacy counts with true zeros
 # Official RXDCOUNT tables by cycle
 rx_tables <- tryCatch(
   nhanesA::nhanesSearchVarName(varname = "RXDCOUNT", ystart = 2003, ystop = 2018, namesonly = TRUE),
@@ -292,7 +272,7 @@ rx_official <- purrr::map_dfr(rx_tables, function(tbl) {
     dplyr::summarise(rxdcount = dplyr::coalesce(dplyr::first(na.omit(rxdcount)), NA_real_), .groups = "drop")
 })
 
-# Fallback: count only valid medication rows in RXQ_RX* (ignore header-only rows)
+# Fallback: count only valid medication rows in RXQ_RX* 
 rx_alt <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
   tbl <- paste0("RXQ_RX", suf)
   df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
@@ -331,7 +311,7 @@ comorb_vars <- c(
 )
 # Include 16 conditions: angina pectoris, arthritis, asthma, chronic bronchitis, congestive heart failure, coronary heart disease, diabetes, emphysema, gout, hypertension, liver condition, myocardial infarction, obesity, stroke, thyroid problems, and kidney disease
 
-# Pull each module across cycles (quiet)
+# Pull each module across cycles
 mcq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
   df <- safe_get("MCQ", .x)
   keep <- intersect(names(df), c("seqn", comorb_vars))
@@ -372,7 +352,6 @@ mcq_clean <- health_wide %>%
   dplyr::select(seqn, comorbidity_n)
 
 # Insurance: HIQ011 -> Yes/No/Unknown
-
 hiq_all <- purrr::map_dfr(cycle_meta$suffix, ~{
   df <- nhanes_get("HIQ", .x, quiet = TRUE); if (is.null(df)) return(tibble())
   df <- janitor::clean_names(df)
@@ -470,7 +449,7 @@ analytic <- df45 %>%
     ucod_leading
   )
 
-# Create complete-case set for models (uses categorical indfmpir_cat)
+# Create complete-case set for models
 model_vars <- c("age_cat","sex","race_eth","ed_cat","indfmpir_cat",
                 "insured","poly_cat","comorbidity_n","time_y","event","sddsrvyr")
 
@@ -478,7 +457,7 @@ analytic_final <- analytic %>%
   filter(if_all(all_of(model_vars), ~ !is.na(.))) %>%
   mutate(
     event_f = factor(event, levels = c(0,1), labels = c("Alive/Censored","Deceased")),
-    wtint_pool = wtint2yr / 10  # pooled weight across 10 cycles
+    wtint_pool = wtint2yr / 8  # pooled weight across 8 cycles
   )
 
 # Survey designs (for models)
@@ -493,7 +472,7 @@ print(missingness_summary(analytic %>% select(age_cat, sex, race_eth, ed_cat, in
 ```
 
 
-## Table 1: Descriptive statistics (unweighted)
+## Table 1: Descriptive statistics
 ```{r}
 tbl1_by_outcome <- gtsummary::tbl_summary(
   data = analytic_final,
@@ -650,7 +629,7 @@ ref_row <- tibble::tibble(
 # Prediction grid across medication counts
 grid <- tidyr::crossing(rxdcount = 0:25, ref_row)
 
-# Predict linear predictors; try to get SEs if supported; otherwise skip SEs
+# Predict linear predictors
 p_out <- tryCatch(
   predict(m_spline_svy, newdata = grid, type = "lp", se.fit = TRUE),
   error = function(e) NULL
