@@ -1,7 +1,7 @@
 ---
 title: 'SPPH604: Statistical Analysis Plan Analytic Code'
 author: "Teal Green (Alexi, Alex, Ezra)"
-date: "2025-10-13"
+date: "2025-10-14"
 output:
   word_document: default
   pdf_document:
@@ -297,6 +297,98 @@ rx_all <- demo_roster %>%
   dplyr::left_join(rx_alt,      by = "seqn") %>%
   dplyr::mutate(rxdcount = dplyr::coalesce(as.numeric(rxdcount), as.numeric(rxdcount_alt), 0)) %>%
   dplyr::select(seqn, rxdcount)
+
+# RX: Polypharmacy counts with true zeros
+
+# RX: Therapeutic classes
+# Therapeutic class information is contained in a separate dictionary-like file called RXQ_DRUG. It provides therapeutic information about the drug products reported by respondents. The therapeutic class system has 3-levels, and we will focus on the 1st level only. Up to 4 classes may be assigned to a single drug product. We will retrieve RXDDCI1A, RXDDCI2A, RXDDCI3A, and RXDDCI4A - these correspond to the 1st levels of the 4 classes. 
+# Documentation states to merge with respondent-level prescription medication use based on RXDDRGID, and this linkage approach is valid for: NHANES III (1988–1994), NHANES 1999–2000, 2001–2002, 2003–2004, 2005–2006, 2007–2008, 2009–2010, 2011–2012, 2013–2014, 2015–2016, 2017–2018, and 2017–March 2020. Proceed with the merge.
+
+rx_info <- suppressWarnings(
+  nhanesA::nhanesFromURL(url = "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/1988/DataFiles/RXQ_DRUG.xpt",
+                       translated = TRUE
+                       ) %>%
+  janitor::clean_names() %>%
+    dplyr::transmute(
+      rxddrgid = as.character(rxddrgid),
+      rxddci1a = trimws(rxddci1a),
+      rxddci2a = trimws(rxddci2a),
+      rxddci3a = trimws(rxddci3a),
+      rxddci4a = trimws(rxddci4a))
+)
+
+# Join therapeutic classes to respondent prescriptions across all cycles
+rx_class_joined <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
+  tbl <- paste0("RXQ_RX", suf)
+  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
+  if (is.null(df)) return(tibble())
+  
+  df %>%
+    janitor::clean_names() %>%
+    dplyr::mutate(
+      seqn = as.integer(seqn),
+      rxddrgid = suppressWarnings(as.character(rxddrgid))
+    ) %>%
+    # Attach therapeutic class info
+    dplyr::left_join(rx_info, by = "rxddrgid") %>%
+  # Collapse across the 4 possible first-level classes per drug
+    dplyr::mutate(
+      class1 = rxddci1a,
+      class2 = rxddci2a,
+      class3 = rxddci3a,
+      class4 = rxddci4a
+    ) %>%
+    tidyr::pivot_longer(
+      cols = dplyr::starts_with("class"),
+      names_to = "slot",
+      values_to = "class_code",
+      values_drop_na = TRUE
+    ) %>%
+    dplyr::filter(nzchar(class_code)) %>%
+    # Mark unique class presence per respondent (not counts)
+    dplyr::distinct(seqn, class_code) %>%
+    dplyr::mutate(has_class = 1L)
+})
+
+# Pivot to wide format: 1 row per respondent, 1/0 indicator per therapeutic class (NA if respondent reported 0 medications)
+rx_classes_wide <- rx_class_joined %>%
+  tidyr::pivot_wider(
+    names_from = class_code,
+    values_from = has_class,
+    values_fill = 0
+  )
+
+# Assign new column names. There are no helper columns, as the names come from the documentation.
+rx_classes_wide_name <- rx_classes_wide %>%
+  rename(
+  seqn = seqn,
+ rx_respiratory = "122",
+ rx_cns = "57",
+ rx_cardiovascular = "40",
+ rx_topical = "133",
+ rx_hormone = "97",
+ rx_psychotherapeutic = "242",
+ rx_metabolic = "358",
+ rx_coagulation = "81",
+ rx_gastrointestinal = "87",
+ rx_antiinfective = "1",
+ rx_misc = "105",
+ rx_genitourinary = "113",
+ rx_immunologic = "254",
+ rx_nutrition = "115",
+ rx_antineoplastic = "20",
+ rx_biological = "28",
+ rx_alternative = "218",
+ rx_radiologic = "331",
+ rx_plasma_expander = "153"
+  )
+
+# Merge into rx_all
+rx_all <- rx_all %>%
+  dplyr::left_join(rx_classes_wide_name, by = "seqn")
+
+# Clean up unnecessary RX tables
+rm(rx_info, rx_class_joined, rx_classes_wide,rx_classes_wide_name)
 
 # Comorbidities: MCQ + DIQ010 + BPQ020 + KIQ022
 # Target item names after clean_names() (all lower case)
@@ -799,3 +891,4 @@ spline_tbl <- gtsummary::tbl_regression(
 
 spline_tbl
 ```
+
