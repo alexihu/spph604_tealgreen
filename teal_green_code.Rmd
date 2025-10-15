@@ -1,894 +1,1154 @@
 ---
-title: 'SPPH604: Statistical Analysis Plan Analytic Code'
+title: "SPPH604: Polypharmacy & Mortality – Reproducible Analyses (MI pooled)"
 author: "Teal Green (Alexi, Alex, Ezra)"
-date: "2025-10-14"
+date: "`r format(Sys.Date())`"
 output:
-  word_document: default
-  pdf_document:
-    latex_engine: xelatex
   html_document:
     df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(604)
 ```
 
-## Statistical Analysis Plan
+# Overview
 
-This is an R Markdown document of the reproducible code for the statistical analysis plan from Teal Green for SPPH604.
+This document **loads** the cleaned analytic dataset produced by `data_clean.R` and performs the analysis.  
+We follow NHANES best practice: build the **survey design first (on the full dataset)**, apply **eligibility via survey subsetting**, and then conduct analyses. Missingness in key variables is addressed with **multiple imputation (MI)**, and **all models are fit and pooled across imputations** unless noted.
 
-Our research question is: Among U.S. adults aged 45 years or above in NHANES 2003–2018, are levels of polypharmacy associated with all-cause mortality?
+**Research question.** Among U.S. adults aged 45 years or above in NHANES 2003–2018, are levels of medication use associated with all‑cause mortality?
 
-PICOT Elements
+**PICOT elements**  
+**Population (P):** U.S. adults aged 45+ in the 2003–2018 NHANES cycles.  
+**Intervention/Exposure (I):** Polypharmacy level by number of medications at interview: No polypharmacy (0 medications), polypharmacy (5–9), hyperpolypharmacy (≥10).  
+**Comparator (C):** Low medication use (1–4).  
+**Outcome (O):** Time from interview to **all‑cause mortality** (or censoring) using NHANES‑linked mortality files.  
+**Timeframe (T):** Up to ~17 years of follow‑up (through 2019 linkage in public files).  
+**Confounders (a priori):** Age (RIDAGEYR), sex (RIAGENDR), race/ethnicity (RIDRETH1), education (DMDEDUC2), **income‑to‑poverty ratio (INDFMPIR; imputed via PMM)**, health insurance (HIQ011), comorbidity burden (count and Charlson‑like score), and healthcare utilization (doctor visits; overnight hospital stays). Survey strata, PSU, and interview weights are used throughout.
 
-**Population (P)**: U.S. adults aged 45 years and up from the 2003–2018 NHANES cycles.
+> **Notes on changes vs original plan:** Our primary categorical exposure uses **1–4 medications as the reference** in regression models, aligning with clinical interpretation of "low polypharmacy" as the baseline. For the spline sensitivity, we display HRs **relative to 0 medications** to visualize the entire dose‑response curve from zero upward. Covariate adjustment has been expanded to include insurance status and utilization measures.
 
-**Intervention/Exposure (I)**: Levels of polypharmacy categorized by number of medications reported at their interview: low polypharmacy (1 to 4 medications reported), polypharmacy (5 to 9), hyperpolypharmacy (≥10)
-
-**Comparator (C)**: No polypharmacy (0)
-
-**Outcome (O)**: Risk of all-cause mortality time from NHANES interview to all-cause death or censoring at the end of follow-up
-
-**Timeframe (T)**: Up to 15 years of follow-up through NHANES-linked mortality files.
-
-**Confounders**: sex RIAGENDR, race/ethnicity RIDRETH1/ RIDRETH3, age RIDAGEYR, survey cycle indicator SDDSRVYR, education DMDEDUC2, income-to-poverty ratio INDFMPIR, MCQ (comorbidity count/index), insurance HIQ011
-
-### Load packages and define NHANES cycles
+## Packages
 
 ```{r}
-#| message: false
-#| warning: false
-#| echo: true
+library(tidyverse)
+library(survey)
+library(survival)
+library(gtsummary)
+library(gt)
+library(broom)
+library(mice)
+library(mitools)
+library(naniar)
+library(ggplot2)
+library(scales)
 
-# Load packages
-library(pacman)
-pacman::p_load(
-  tidyverse, nhanesA, janitor, haven, readr, stringr,
-  survival, survey, gtsummary, gt, broom, splines
-)
-
-options(survey.lonely.psu = "adjust")  # reasonable default for single-PSU strata
-
-# Define 2-year NHANES cycles used
-cycle_meta <- tibble::tribble(
-  ~cycle,        ~suffix,
-  "2003-2004",   "_C",
-  "2005-2006",   "_D",
-  "2007-2008",   "_E",
-  "2009-2010",   "_F",
-  "2011-2012",   "_G",
-  "2013-2014",   "_H",
-  "2015-2016",   "_I",
-  "2017-2018",   "_J"
-)
+options(survey.lonely.psu = "adjust")
 ```
 
-### Import NHANES linked mortality dataset from 2003-2018
+## Load analytic dataset & survey design
 
 ```{r}
-# List all mortality .dat files (already downloaded to data/mortality/)
-files <- list.files("data/mortality", full.names = TRUE, pattern = "\\.dat$", ignore.case = TRUE)
+# Read the raw analytic dataset produced by data_clean.R
+analytic_raw <- readRDS("data/analytic_raw.rds")
 
-# Fixed-width spec for public-use mortality files
-spec <- fwf_cols(
-  SEQN         = c(1, 6),
-  eligstat     = c(15, 15),
-  mortstat     = c(16, 16),
-  ucod_leading = c(17, 19),
-  diabetes     = c(20, 20),
-  hyperten     = c(21, 21),
-  permth_int   = c(43, 45),
-  permth_exm   = c(46, 48)
+# Pool interview weights across 8 cycles (2003–2018)
+analytic_raw <- analytic_raw %>% mutate(wtint_pool = wtint2yr / 8)
+
+# Build survey design on the full dataset
+dsgn_all <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra,
+                      weights = ~wtint_pool, nest = TRUE,
+                      data = analytic_raw)
+
+# Eligibility: age >= 45, non-missing survival outcome/time
+dsgn_elig <- subset(dsgn_all, !is.na(ridageyr) & ridageyr >= 45 & !is.na(time_y) & event %in% c(0,1))
+
+# Derive model-ready factors inside the survey design
+dsgn_elig <- update(
+  dsgn_elig,
+  age_years   = ridageyr,
+  age_cat     = factor(case_when(
+                    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+                    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+                    ridageyr >= 80                 ~ "80 or above"),
+                    levels = c("45-64","65-79","80 or above")),
+  sex         = sex,
+  race_eth    = race_eth,    
+  ed_cat      = ed_cat,       
+  insured     = insured,       
+  rxdcount    = rxdcount,
+  poly_cat    = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),  
+  comorbidity_n = as.numeric(comorbidity_n),
+  cci_score     = as.numeric(cci_score),
+  visits_cat    = visits_cat,
+  hosp_stays_cat= hosp_stays_cat,
+  time_y        = time_y,
+  event         = event,
+  ucod_leading  = ucod_leading
 )
 
-# Extract cycle label from filename
-get_cycle <- function(path) {
-  fn <- basename(path)
-  m  <- stringr::str_match(fn, "NHANES_(\\d{4})_(\\d{4})")
-  if (is.na(m[1,2])) NA_character_ else paste0(m[1,2], "/", m[1,3])
-}
-
-# Reader for one mortality file
-read_one <- function(path) {
-  cy <- get_cycle(path)
-  readr::read_fwf(
-    file          = path,
-    col_positions = spec,
-    col_types     = "iiiiiiii",
-    na            = c("", ".")
-  ) %>%
-    dplyr::mutate(cycle = cy, .before = 1)
-}
-
-# Combine all mortality files and keep linkage-eligible participants
-nhanes_mortality <- purrr::map_dfr(files, read_one) %>%
-  dplyr::filter(eligstat == 1)
-
-# Quick peek
-glimpse(nhanes_mortality)
+elig_df <- dsgn_elig$variables
+glimpse(elig_df)
 ```
 
-## Helper functions for recoding NHANES data
+# Missingness review (post‑eligibility)
+
+We inspect **INDFMPIR** and **insured** after eligibility subsetting.
 
 ```{r}
-# Clean numeric from char-like NHANES fields
-to_num <- function(x) {
-  x <- trimws(as.character(x))
-  x[x %in% c("", ".", "..", "...")] <- NA_character_
-  as.numeric(x)
-}
+# Summaries of missingness
+miss_vars <- c("indfmpir","insured")
+elig_df %>% miss_var_summary(include = all_of(miss_vars))
 
-# Sex (RIAGENDR)
-recode_sex <- function(x) {
-  xn <- suppressWarnings(as.numeric(x))
-  out <- dplyr::case_when(xn == 1 ~ "Male", xn == 2 ~ "Female", TRUE ~ NA_character_)
-  factor(out, levels = c("Male","Female"))
-}
-
-# Race/ethnicity; use RIDRETH3 when present (2011–18)
-derive_race_eth <- function(df) {
-  ridreth1 <- suppressWarnings(as.numeric(df$ridreth1))
-  ridreth3 <- suppressWarnings(as.numeric(df$ridreth3))
-  map_r1 <- c(`1`="Mexican American", `2`="Other Hispanic",
-              `3`="Non-Hispanic White", `4`="Non-Hispanic Black", `5`="Other/Multi")
-  map_r3 <- c(`1`="Non-Hispanic White", `2`="Non-Hispanic Black",
-              `3`="Non-Hispanic Asian", `4`="Other/Multi",
-              `6`="Mexican American", `7`="Other Hispanic")
-  use3 <- !is.na(ridreth3)
-  out <- ifelse(use3, unname(map_r3[as.character(ridreth3)]),
-                unname(map_r1[as.character(ridreth1)]))
-  factor(out, levels = c("Non-Hispanic White","Non-Hispanic Black",
-                         "Non-Hispanic Asian","Mexican American",
-                         "Other Hispanic","Other/Multi"))
-}
-
-# Education (DMDEDUC2) — 4 levels + "Unknown"
-derive_ed_cat <- function(x) {
-  v <- suppressWarnings(as.numeric(x))
-  out <- dplyr::case_when(
-    v %in% c(1, 2) ~ "Less than HS",
-    v == 3         ~ "HS/GED",
-    v == 4         ~ "Some college",
-    v == 5         ~ "College+",
-    v %in% c(7, 9) ~ "Unknown",
-    TRUE           ~ "Unknown"
-  )
-  factor(out, levels = c("Less than HS","HS/GED","Some college","College+","Unknown"))
-}
-
-# Insurance HIQ011 robust recode -> 1/0/NA, then map to Yes/No/Unknown later
-recode_hiq011_yesno <- function(x) {
-  xs <- trimws(as.character(x))
-  xs[xs %in% c("", ".", "..", "...")] <- NA_character_
-  lead_num <- suppressWarnings(as.numeric(stringr::str_extract(xs, "^[0-9]+")))
-  out_num <- dplyr::case_when(
-    !is.na(lead_num) & lead_num == 1 ~ 1L,
-    !is.na(lead_num) & lead_num == 2 ~ 0L,
-    TRUE ~ NA_integer_
-  )
-  need_fallback <- is.na(out_num) & !is.na(xs)
-  xs_up <- toupper(xs)
-  out_fallback <- dplyr::case_when(
-    stringr::str_detect(xs_up, "\\bYES\\b|\\bCOVERED\\b")       ~ 1L,
-    stringr::str_detect(xs_up, "\\bNO\\b|\\bNOT\\s+COVERED\\b") ~ 0L,
-    TRUE ~ NA_integer_
-  )
-  ifelse(need_fallback, out_fallback, out_num)
-}
-
-# MCQ recode helper for comorbidity: 1/Yes -> 1; everything else (No/Refused/DK/blank) -> 0
-mcq_yes1_else0 <- function(x) {
-  xs <- trimws(as.character(x))
-  # numeric first
-  xn <- suppressWarnings(as.numeric(xs))
-  out <- ifelse(!is.na(xn), ifelse(xn == 1, 1L, 0L), NA_integer_)
-  # text fallback if needed
-  need_fb <- is.na(out) & !is.na(xs)
-  xs_up <- toupper(xs)
-  fb <- ifelse(grepl("\\bYES\\b", xs_up), 1L, 0L)
-  out[need_fb] <- fb[need_fb]
-  out[is.na(out)] <- 0L  # missing counts as 0 per spec
-  as.integer(out)
-}
-
-# Missingness audit for a data frame
-missingness_summary <- function(d) {
-  tibble::tibble(
-    variable = names(d),
-    n = nrow(d),
-    missing_n = vapply(d, function(x) sum(is.na(x)), integer(1)),
-    non_missing_n = n - missing_n,
-    missing_pct = round(100 * missing_n / n, 2)
-  ) %>% arrange(desc(missing_pct), variable)
-}
-
-# Basic nhanesA getter
-nhanes_get <- function(table_base, suffix, quiet = FALSE) {
-  nm <- paste0(table_base, suffix)
-  if (!quiet) message("Downloading ", nm, " ...")
-  out <- tryCatch(
-    suppressWarnings(nhanesA::nhanes(nm)),
-    error = function(e) NULL
-  )
-  if (is.null(out)) return(NULL)
-  out %>% janitor::clean_names() %>% haven::zap_labels()
-}
-
-# Safe pull: always returns at least SEQN, lowercased
-safe_get <- function(base, suf) {
-  df <- nhanes_get(base, suf, quiet = TRUE)
-  if (is.null(df)) return(tibble(seqn = integer()))
-  df <- janitor::clean_names(df)
-  if (!"seqn" %in% names(df)) df$seqn <- NA
-  dplyr::mutate(df, seqn = as.integer(seqn))
-}
-
-# Yes = 1; everything else (No/Refused/DK/Missing or not-asked) = 0
-yes1_else0 <- function(x) {
-  xs <- trimws(as.character(x))
-  xs[xs %in% c("", ".", "..", "...")] <- NA_character_
-  xn <- suppressWarnings(as.numeric(xs))
-  out <- ifelse(!is.na(xn), ifelse(xn == 1, 1L, 0L),
-                ifelse(grepl("^YES$", toupper(xs)), 1L, 0L))
-  out[is.na(out)] <- 0L
-  as.integer(out)
-}
-```
-
-## Query NHANES components (DEMO, RXQ_RX, MCQ, HIQ)
-
-```{r}
-# DEMO (age, sex, race/eth, education, income-to-poverty, design vars)
-demo_all <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- nhanes_get("DEMO", .x, quiet = TRUE); if (is.null(df)) return(tibble())
-  df %>%
-    dplyr::select(dplyr::any_of(c(
-      "seqn","sddsrvyr","ridageyr","riagendr","ridreth1","ridreth3",
-      "dmdeduc2","indfmpir","wtint2yr","sdmvpsu","sdmvstra"
-    )))
-})
-stopifnot(nrow(demo_all) > 0)
-
-# Roster = one row per participant
-demo_roster <- demo_all %>% dplyr::transmute(seqn = as.integer(seqn)) %>% dplyr::distinct()
-
-# RX: Polypharmacy counts with true zeros
-# Official RXDCOUNT tables by cycle
-rx_tables <- tryCatch(
-  nhanesA::nhanesSearchVarName(varname = "RXDCOUNT", ystart = 2003, ystop = 2018, namesonly = TRUE),
-  error = function(e) character(0)
-)
-stopifnot(length(rx_tables) > 0)
-
-rx_official <- purrr::map_dfr(rx_tables, function(tbl) {
-  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
-  if (is.null(df)) return(tibble())
-  df %>%
-    janitor::clean_names() %>%
-    dplyr::transmute(seqn = as.integer(seqn),
-                     rxdcount = suppressWarnings(as.numeric(rxdcount))) %>%
-    dplyr::group_by(seqn) %>%
-    dplyr::summarise(rxdcount = dplyr::coalesce(dplyr::first(na.omit(rxdcount)), NA_real_), .groups = "drop")
-})
-
-# Fallback: count only valid medication rows in RXQ_RX* 
-rx_alt <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
-  tbl <- paste0("RXQ_RX", suf)
-  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
-  if (is.null(df)) return(tibble())
-  df <- janitor::clean_names(df)
-  df %>%
-    dplyr::mutate(
-      seqn         = as.integer(seqn),
-      rxduse_n     = suppressWarnings(as.numeric(rxduse)),
-      rxddrgid_n   = suppressWarnings(as.numeric(rxddrgid)),
-      has_drugcode = !is.na(rxddrgid_n),
-      has_drugname = !is.na(rxddrug) & nzchar(trimws(rxddrug)),
-      med_row      = (rxduse_n == 1) & (has_drugcode | has_drugname)
-    ) %>%
-    dplyr::group_by(seqn) %>%
-    dplyr::summarise(rxdcount_alt = sum(med_row, na.rm = TRUE), .groups = "drop")
-})
-
-# Final RX dataset (prefer official; else fallback; else 0)
-rx_all <- demo_roster %>%
-  dplyr::left_join(rx_official, by = "seqn") %>%
-  dplyr::left_join(rx_alt,      by = "seqn") %>%
-  dplyr::mutate(rxdcount = dplyr::coalesce(as.numeric(rxdcount), as.numeric(rxdcount_alt), 0)) %>%
-  dplyr::select(seqn, rxdcount)
-
-# RX: Polypharmacy counts with true zeros
-
-# RX: Therapeutic classes
-# Therapeutic class information is contained in a separate dictionary-like file called RXQ_DRUG. It provides therapeutic information about the drug products reported by respondents. The therapeutic class system has 3-levels, and we will focus on the 1st level only. Up to 4 classes may be assigned to a single drug product. We will retrieve RXDDCI1A, RXDDCI2A, RXDDCI3A, and RXDDCI4A - these correspond to the 1st levels of the 4 classes. 
-# Documentation states to merge with respondent-level prescription medication use based on RXDDRGID, and this linkage approach is valid for: NHANES III (1988–1994), NHANES 1999–2000, 2001–2002, 2003–2004, 2005–2006, 2007–2008, 2009–2010, 2011–2012, 2013–2014, 2015–2016, 2017–2018, and 2017–March 2020. Proceed with the merge.
-
-rx_info <- suppressWarnings(
-  nhanesA::nhanesFromURL(url = "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/1988/DataFiles/RXQ_DRUG.xpt",
-                       translated = TRUE
-                       ) %>%
-  janitor::clean_names() %>%
-    dplyr::transmute(
-      rxddrgid = as.character(rxddrgid),
-      rxddci1a = trimws(rxddci1a),
-      rxddci2a = trimws(rxddci2a),
-      rxddci3a = trimws(rxddci3a),
-      rxddci4a = trimws(rxddci4a))
-)
-
-# Join therapeutic classes to respondent prescriptions across all cycles
-rx_class_joined <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
-  tbl <- paste0("RXQ_RX", suf)
-  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
-  if (is.null(df)) return(tibble())
-  
-  df %>%
-    janitor::clean_names() %>%
-    dplyr::mutate(
-      seqn = as.integer(seqn),
-      rxddrgid = suppressWarnings(as.character(rxddrgid))
-    ) %>%
-    # Attach therapeutic class info
-    dplyr::left_join(rx_info, by = "rxddrgid") %>%
-  # Collapse across the 4 possible first-level classes per drug
-    dplyr::mutate(
-      class1 = rxddci1a,
-      class2 = rxddci2a,
-      class3 = rxddci3a,
-      class4 = rxddci4a
-    ) %>%
-    tidyr::pivot_longer(
-      cols = dplyr::starts_with("class"),
-      names_to = "slot",
-      values_to = "class_code",
-      values_drop_na = TRUE
-    ) %>%
-    dplyr::filter(nzchar(class_code)) %>%
-    # Mark unique class presence per respondent (not counts)
-    dplyr::distinct(seqn, class_code) %>%
-    dplyr::mutate(has_class = 1L)
-})
-
-# Pivot to wide format: 1 row per respondent, 1/0 indicator per therapeutic class (NA if respondent reported 0 medications)
-rx_classes_wide <- rx_class_joined %>%
-  tidyr::pivot_wider(
-    names_from = class_code,
-    values_from = has_class,
-    values_fill = 0
-  )
-
-# Assign new column names. There are no helper columns, as the names come from the documentation.
-rx_classes_wide_name <- rx_classes_wide %>%
-  rename(
-  seqn = seqn,
- rx_respiratory = "122",
- rx_cns = "57",
- rx_cardiovascular = "40",
- rx_topical = "133",
- rx_hormone = "97",
- rx_psychotherapeutic = "242",
- rx_metabolic = "358",
- rx_coagulation = "81",
- rx_gastrointestinal = "87",
- rx_antiinfective = "1",
- rx_misc = "105",
- rx_genitourinary = "113",
- rx_immunologic = "254",
- rx_nutrition = "115",
- rx_antineoplastic = "20",
- rx_biological = "28",
- rx_alternative = "218",
- rx_radiologic = "331",
- rx_plasma_expander = "153"
-  )
-
-# Merge into rx_all
-rx_all <- rx_all %>%
-  dplyr::left_join(rx_classes_wide_name, by = "seqn")
-
-# Clean up unnecessary RX tables
-rm(rx_info, rx_class_joined, rx_classes_wide,rx_classes_wide_name)
-
-# Comorbidities: MCQ + DIQ010 + BPQ020 + KIQ022
-# Target item names after clean_names() (all lower case)
-comorb_vars <- c(
-  # MCQ (ever told …)
-  "mcq010","mcq080","mcq160n","mcq160b","mcq160c","mcq160d",
-  "mcq160e","mcq160f","mcq160m","mcq160g","mcq160k","mcq160l","mcq220",
-  # Other modules
-  "diq010",  # diabetes
-  "bpq020",  # hypertension
-  "kiq022",   # kidney disease
-  # Some additions
-  "diq080", # diabetes with retinopathy
-  "mcq190", # rheumatoid arthritis 2003/4 to 2007/8 to replace arthritis of any kind ("mcq160a")
-  "mcq191", # rheumatoid arthritis 2009/10 to replace arthritis of any kind ("mcq160a")
-  "mcq195" # rheumatoid arthritis 2011/12 to 2017/18 to replace arthritis of any kind ("mcq160a")
-)
-
-comorb_vars_reduced <- c(
-  "mcq010","mcq080","mcq160n","mcq160b","mcq160c","mcq160d",
-  "mcq160e","mcq160f","mcq160m","mcq160g","mcq160k","mcq160l","mcq220",
-  "bpq020",  
-  "kiq022",   
-  "diq_noret",
-  "diq_ret", 
-  "mcq_ra" 
-)
-
-## Create weights
-comorb_weights <- c(
-  
-  mcq010 = 0 ,
-  mcq080 = 0 ,
-  mcq160n = 0 ,
-  mcq160b = 1,
-  mcq160c = 0,
-  mcq160d = 0,
-  mcq160e = 1,
-  mcq160f = 1,
-  mcq160m = 0,
-  mcq160g = 1,
-  mcq160k = 1,
-  mcq160l = 2,
-  mcq220 = 2,
-  diq_noret = 1,  # diabetes needs a recode for diq080 and diq010 first
-  diq_ret = 2,  # diabetes needs a recode for diq080 and diq010 first
-  bpq020 = 0 ,  
-  kiq022 = 2,   
-  mcq_ra = 1
-)
-  
-# Include 16 conditions: angina pectoris, arthritis, asthma, chronic bronchitis, congestive heart failure, coronary heart disease, diabetes, emphysema, gout, hypertension, liver condition, myocardial infarction, obesity, stroke, thyroid problems, and kidney disease
-
-# Pull each module across cycles
-mcq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- safe_get("MCQ", .x)
-  keep <- intersect(names(df), c("seqn", comorb_vars))
-  dplyr::select(df, dplyr::all_of(keep))
-})
-
-diq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- safe_get("DIQ", .x)
-  if ("diq010" %in% names(df)) dplyr::select(df, seqn, diq010, diq080) else tibble(seqn = df$seqn)
-})
-
-bpq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- safe_get("BPQ", .x)
-  if ("bpq020" %in% names(df)) dplyr::select(df, seqn, bpq020) else tibble(seqn = df$seqn)
-})
-
-kiq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- safe_get("KIQ_U", .x)
-  if ("kiq022" %in% names(df)) dplyr::select(df, seqn, kiq022) else tibble(seqn = df$seqn)
-})
-
-# Start from roster to keep everyone; left-join modules
-health_wide <- demo_roster %>%
-  dplyr::left_join(mcq_wide, by = "seqn") %>%
-  dplyr::left_join(diq_wide, by = "seqn") %>%
-  dplyr::left_join(bpq_wide, by = "seqn") %>%
-  dplyr::left_join(kiq_wide, by = "seqn")
-
-# Ensure all comorbidity columns exist; create if missing (as NA -> will be coded 0)
-for (v in comorb_vars) {
-  if (!v %in% names(health_wide)) health_wide[[v]] <- NA
-}
-
-# Create diabetes column and a rheumatoid arthritis column
-health_wide <- health_wide %>%
- mutate(
-    diq_noret = case_when(
-      diq010 == "Yes" & diq080 == "No" ~ "Yes",          # diabetes, no retinopathy
-      diq010 == "Yes" & diq080 == "Yes" ~ "No",          # diabetes, with retinopathy
-      diq010 == "No" ~ "No",                        # no diabetes
-      TRUE ~ NA_character_
-    ),
-    diq_ret = case_when(
-      diq010 == "Yes" & diq080 == "Yes" ~ "Yes",          # diabetes, retinopathy
-      diq010 == "Yes" & diq080 == "No" ~ "No",          # diabetes, no retinopathy
-      diq010 == "No" ~ "No",                        # no diabetes
-      TRUE ~ NA_character_
-    ),
-    mcq_ra = case_when(
-        mcq190 == "Rheumatoid arthritis"  ~ "Yes",
-        mcq191 == "Rheumatoid arthritis"  ~ "Yes", 
-        mcq195 == "Rheumatoid arthritis"  ~ "Yes",
-        TRUE ~ NA_character_
-    )
-  )
-
-# Recode to 1/0 first
-health_num <- health_wide %>%
-  dplyr::mutate(dplyr::across(dplyr::all_of(comorb_vars_reduced), yes1_else0))
-
-# Compute count by sum, calculate weighted sum 
-comorb_matrix <- as.matrix(health_num[dplyr::all_of(comorb_vars_reduced)])
-weights_vec <- unlist(comorb_weights[comorb_vars_reduced])
-
-mcq_clean <- health_num %>%
-  dplyr::mutate(
-    comorbidity_n = rowSums(comorb_matrix, na.rm = TRUE),
-    comorbidity_cci = as.numeric(comorb_matrix %*% weights_vec)
-  ) %>%
-  dplyr::select(seqn, comorbidity_n, comorbidity_cci)
-
-
-# Insurance: HIQ011 -> Yes/No/Unknown
-hiq_all <- purrr::map_dfr(cycle_meta$suffix, ~{
-  df <- nhanes_get("HIQ", .x, quiet = TRUE); if (is.null(df)) return(tibble())
-  df <- janitor::clean_names(df)
-  nm <- names(df)
-  cand <- nm[stringr::str_detect(nm, "^hiq011")]
-  tibble(
-    seqn       = as.integer(df$seqn),
-    hiq011_raw = if (length(cand)) as.character(df[[cand[1]]]) else NA_character_
-  )
-}) %>%
-  dplyr::mutate(
-    yn = recode_hiq011_yesno(hiq011_raw),
-    insured = dplyr::case_when(
-      yn == 1L ~ "Yes",
-      yn == 0L ~ "No",
-      TRUE     ~ "Unknown"
-    ),
-    insured = factor(insured, levels = c("No","Yes","Unknown"))
-  ) %>%
-  dplyr::select(seqn, insured)
-```
-
-## Merge, inclusion criteria (age ≥ 45), construct exposure + covariates
-
-```{r}
-# mortality vars needed
-mort_keep <- nhanes_mortality %>%
-  rename_with(tolower) %>%
-  select(seqn, mortstat, permth_int, permth_exm, ucod_leading)
-
-# Merge all components
-raw <- demo_all %>%
-  mutate(seqn = as.integer(seqn)) %>%
-  left_join(rx_all,     by = "seqn") %>%
-  left_join(mcq_clean,  by = "seqn") %>%
-  left_join(hiq_all,    by = "seqn") %>%
-  inner_join(mort_keep, by = "seqn")
-
-# Keep ≥45 (middle-age); build exposure, covariates, and time/event
-df45 <- raw %>%
-  filter(!is.na(ridageyr) & ridageyr >= 45) %>%
+# Cross-tab of missingness indicators vs key predictors (simple MAR diagnostics)
+elig_df <- elig_df %>%
   mutate(
-    # exposure (polypharmacy categories)
-    rxdcount = suppressWarnings(as.numeric(rxdcount)),
-    poly_cat = case_when(
-      !is.na(rxdcount) & rxdcount == 0        ~ "0",
-      !is.na(rxdcount) & rxdcount >= 1 & rxdcount <= 4 ~ "1–4",
-      !is.na(rxdcount) & rxdcount >= 5 & rxdcount <= 9 ~ "5–9",
-      !is.na(rxdcount) & rxdcount >= 10       ~ "≥10",
-      TRUE ~ NA_character_
-    ) %>% factor(levels = c("0","1–4","5–9","≥10")),
-
-    # core demo + SES
-    age_cat = case_when(
-      ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-      ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-      ridageyr >= 80 ~ "80 or above"
-    ) %>% factor(levels = c("45-64", "65-79", "80 or above")),
-    
-    sex       = recode_sex(riagendr),
-    race_eth  = derive_race_eth(cur_data()),
-    ed_cat    = derive_ed_cat(dmdeduc2),
-
-    # income-to-poverty: keep numeric + categorical with "Unknown"
-    indfmpir  = to_num(indfmpir),
-    indfmpir_cat = case_when(
-      is.na(indfmpir)        ~ "Unknown",
-      indfmpir < 1           ~ "<1.00 (below poverty)",
-      indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
-      indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
-      indfmpir >= 4          ~ "≥4.00"
-    ) %>% factor(levels = c("<1.00 (below poverty)","1.00–1.99","2.00–3.99","≥4.00","Unknown")),
-
-    # insurance already built as factor(No/Yes/Unknown)
-    insured   = factor(insured, levels = c("No","Yes","Unknown")),
-
-    # survival time/event
-    time_m    = as.numeric(permth_int),
-    time_y    = time_m / 12,
-    event     = as.integer(mortstat)
+    miss_indfmpir = factor(ifelse(is.na(indfmpir), "Missing","Observed")),
+    miss_insured  = factor(ifelse(is.na(insured),  "Missing","Observed"))
   )
 
-# Assemble analytic dataset
-analytic <- df45 %>%
-  filter(!is.na(time_y), event %in% c(0,1)) %>%
+# Patterns with naniar
+vis_miss(elig_df[, c("indfmpir","insured","age_years","sex","race_eth","ed_cat")])
+
+# Simple logistic models for missingness (MCAR would imply no association)
+fit_miss_indf <- glm(I(is.na(indfmpir)) ~ age_years + sex + race_eth + ed_cat + insured,
+                     data = elig_df, family = binomial())
+fit_miss_ins  <- glm(I(is.na(insured)) ~ age_years + sex + race_eth + ed_cat + indfmpir,
+                     data = elig_df, family = binomial())
+
+broom::tidy(fit_miss_indf, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high, p.value)
+# INDFMPIR missingness is strongly patterned by age, race/ethnicity, education, and insurance responses. Not MCAR → use MI (MAR assumption reasonable when conditioning on these).
+
+broom::tidy(fit_miss_ins, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high, p.value)
+# Insurance missingness is also not MCAR; it varies with age, race/ethnicity, education, and income. But we are not imputing insurance and acknowledge that the small residual NA portion isn't ignorable MCAR.
+
+# Comment:
+# Logistic models of missingness reject MCAR for both INDFMPIR and INSURED; MI proceeds under MAR using observed predictors.
+```
+
+# Multiple imputation (MI) for INDFMPIR (PMM)
+
+We impute **only `indfmpir`** using **predictive mean matching (PMM)** with predictors `ed_cat + age_years + sex + race_eth + insured`. We use **m = 20** imputations and **maxit = 10** iterations.
+
+```{r}
+# Prepare mids data.frame with needed fields
+# Convert insured to factor for MI (Yes/No based on non-missing status)
+mi_vars <- elig_df %>%
   transmute(
-    seqn, sddsrvyr,
-    age_cat, sex, race_eth, ed_cat,
-    indfmpir, indfmpir_cat,
-    insured,
-    rxdcount, poly_cat,
-    comorbidity_n,
-    event, time_y,
-    wtint2yr, sdmvpsu, sdmvstra,
-    ucod_leading
+    # analysis variables required to rebuild survey design + outcomes
+    seqn, sddsrvyr, ridageyr = age_years, riagendr, ridreth1, wtint2yr, sdmvpsu, sdmvstra,
+    wtint_pool,
+    time_y, event, ucod_leading,
+    # covariates
+    age_years,
+    sex, race_eth, ed_cat, 
+    insured = factor(ifelse(!is.na(insured), "Yes", "No"), levels = c("No", "Yes")),
+    indfmpir,                # to be imputed
+    rxdcount, poly_cat, comorbidity_n, cci_score, visits_cat, hosp_stays_cat
   )
 
-# Create complete-case set for models
-model_vars <- c("age_cat","sex","race_eth","ed_cat","indfmpir_cat",
-                "insured","poly_cat","comorbidity_n","time_y","event","sddsrvyr")
+# Build empty 'mids' where only indfmpir is imputed
+meth <- make.method(mi_vars)
+pred <- make.predictorMatrix(mi_vars)
 
-analytic_final <- analytic %>%
-  filter(if_all(all_of(model_vars), ~ !is.na(.))) %>%
-  mutate(
-    event_f = factor(event, levels = c(0,1), labels = c("Alive/Censored","Deceased")),
-    wtint_pool = wtint2yr / 8  # pooled weight across 8 cycles
+# Only INDFMPIR is imputed via PMM; all others "" (no imputation)
+meth[] <- ""
+meth["indfmpir"] <- "pmm"
+
+# Predictor set for INDFMPIR
+pred[,] <- 0
+pred["indfmpir", c("ed_cat","age_years","sex","race_eth","insured")] <- 1
+
+imp <- mice(
+  mi_vars,
+  m = 20, maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  seed = 604,
+  printFlag = FALSE
+)
+
+# Derive INDFMPIR categories within each completed dataset
+cut_pir <- function(x) {
+  case_when(
+    is.na(x)            ~ NA_character_,
+    x < 1               ~ "<1.00 (below poverty)",
+    x >= 1 & x < 2      ~ "1.00–1.99",
+    x >= 2 & x < 4      ~ "2.00–3.99",
+    x >= 4              ~ "≥4.00"
+  ) %>% factor(levels = c("<1.00 (below poverty)","1.00–1.99","2.00–3.99","≥4.00"))
+}
+
+# Complete to a list of data.frames with derived indfmpir_cat
+comp_list <- lapply(1:imp$m, function(i) {
+  di <- complete(imp, i)
+  di %>% mutate(indfmpir_cat = cut_pir(indfmpir))
+})
+
+# Build survey designs for each imputed dataset
+design_list <- lapply(comp_list, function(di) {
+  svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+            nest = TRUE, data = di)
+})
+
+# Helper to get complete-case subset inside each imputed dataset
+cc_vars <- c("age_cat","sex","race_eth","ed_cat","indfmpir_cat","insured",
+             "poly_cat","comorbidity_n","cci_score","visits_cat","hosp_stays_cat",
+             "time_y","event")
+design_list <- lapply(design_list, function(dd) {
+  dd <- update(dd,
+               age_cat = factor(case_when(
+                          ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+                          ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+                          ridageyr >= 80                 ~ "80 or above"),
+                          levels = c("45-64","65-79","80 or above")),
+               poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10"))
+  )
+  cc_idx <- complete.cases(dd$variables[, cc_vars])
+  subset(dd, cc_idx)
+})
+```
+
+# Descriptive statistics (MI-completed, imputation #1) with **Overall**
+
+For clarity and reproducibility, we present descriptives using **imputed dataset #1** (fully completed). Continuous variables are **survey‑weighted mean (SD)**; categorical are **unweighted n (%)**. Each table includes an **Overall** column.
+
+```{r}
+d1 <- design_list[[1]]
+dat1 <- d1$variables %>%
+  mutate(event_f = factor(event, levels = c(0,1), labels = c("Alive/Censored","Deceased")))
+
+# Continuous vars
+cont_vars <- c("rxdcount","comorbidity_n","cci_score")
+
+# ========== BY OUTCOME ==========
+
+# Calculate unweighted N by outcome
+n_alive <- sum(dat1$event_f == "Alive/Censored", na.rm = TRUE)
+n_deceased <- sum(dat1$event_f == "Deceased", na.rm = TRUE)
+n_overall <- nrow(dat1)
+
+tbl_cont_outcome <- tbl_svysummary(
+  data       = d1,
+  by         = event,
+  include    = all_of(cont_vars),
+  statistic  = list(all_continuous() ~ "{mean} ({sd})"),
+  missing    = "no",
+  label = list(
+    rxdcount        ~ "Medication count",
+    comorbidity_n   ~ "Number of comorbidities",
+    cci_score       ~ "Charlson-like comorbidity score"
+  )
+) %>%
+  add_overall() %>%
+  modify_header(
+    stat_1 ~ paste0("**0**  \nN = ", format(n_alive, big.mark = ",")),
+    stat_2 ~ paste0("**1**  \nN = ", format(n_deceased, big.mark = ",")),
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  ) %>%
+  bold_labels()
+
+tbl_cat_outcome <- tbl_summary(
+  data       = dat1,
+  by         = event_f,
+  include    = all_of(intersect(
+                c("poly_cat","age_cat","sex","race_eth","ed_cat",
+                  "indfmpir_cat","insured","visits_cat","hosp_stays_cat"),
+                names(dat1))),
+  type       = list(all_categorical() ~ "categorical"),
+  statistic  = list(all_categorical() ~ "{n} ({p}%)"),
+  missing    = "no",
+  label = list(
+    poly_cat        ~ "Polypharmacy (ref = 1–4)",
+    age_cat         ~ "Age group",
+    sex             ~ "Sex",
+    race_eth        ~ "Race/ethnicity",
+    ed_cat          ~ "Education",
+    indfmpir_cat    ~ "Income-to-poverty ratio",
+    insured         ~ "Insurance coverage",
+    visits_cat      ~ "Doctor visits in past year",
+    hosp_stays_cat  ~ "Hospital stays in past year"
+  )
+) %>%
+  add_overall() %>%
+  modify_header(
+    stat_1 ~ paste0("**Alive/Censored**  \nN = ", format(n_alive, big.mark = ",")),
+    stat_2 ~ paste0("**Deceased**  \nN = ", format(n_deceased, big.mark = ",")),
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  ) %>%
+  bold_labels()
+
+tbl_outcome_merged <- tbl_stack(
+  tbls = list(tbl_cont_outcome, tbl_cat_outcome)
+) %>%
+  modify_caption("**Descriptive statistics by outcome (imputation #1)**") %>%
+  modify_footnote(
+    update = all_stat_cols() ~
+      "N represents unweighted sample size. Continuous variables are summarized with survey-weighted mean (SD). Categorical variables are summarized with unweighted n (column %)."
+  ) %>%
+  bold_labels()
+
+as_gt(tbl_outcome_merged)
+
+
+# ========== BY EXPOSURE ==========
+
+dat1 <- dat1 %>% mutate(poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")))
+
+# Calculate unweighted N by poly_cat
+n_by_poly <- table(dat1$poly_cat)
+poly_levels <- levels(dat1$poly_cat)
+
+tbl_cont_exposure <- tbl_svysummary(
+  data       = d1,
+  by         = poly_cat,
+  include    = all_of(cont_vars),
+  statistic  = list(all_continuous() ~ "{mean} ({sd})"),
+  missing    = "no",
+  label = list(
+    rxdcount        ~ "Medication count",
+    comorbidity_n   ~ "Number of comorbidities",
+    cci_score       ~ "Charlson-like comorbidity score"
+  )
+) %>%
+  add_overall() %>%
+  bold_labels()
+
+# Modify headers for each poly_cat level + overall
+for (i in seq_along(poly_levels)) {
+  tbl_cont_exposure <- tbl_cont_exposure %>%
+    modify_header(
+      !!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ", 
+                                      format(n_by_poly[poly_levels[i]], big.mark = ","))
+    )
+}
+tbl_cont_exposure <- tbl_cont_exposure %>%
+  modify_header(
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
   )
 
-# Survey designs (for models)
-dsgn <- svydesign(
-  ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-  nest = TRUE, data = analytic_final
-)
+tbl_cat_exposure <- tbl_summary(
+  data       = dat1,
+  by         = poly_cat,
+  include    = all_of(intersect(
+                c("event_f","age_cat","sex","race_eth","ed_cat",
+                  "indfmpir_cat","insured","visits_cat","hosp_stays_cat"),
+                names(dat1))),
+  type       = list(all_categorical() ~ "categorical"),
+  statistic  = list(all_categorical() ~ "{n} ({p}%)"),
+  missing    = "no",
+  label = list(
+    event_f        ~ "Mortality status",
+    age_cat        ~ "Age group",
+    sex            ~ "Sex",
+    race_eth       ~ "Race/ethnicity",
+    ed_cat         ~ "Education",
+    indfmpir_cat   ~ "Income-to-poverty ratio",
+    insured        ~ "Insurance coverage",
+    visits_cat     ~ "Doctor visits in past year",
+    hosp_stays_cat ~ "Hospital stays in past year"
+  )
+) %>%
+  add_overall(last = TRUE) %>%
+  bold_labels()
 
-# Quick audit
-print(missingness_summary(analytic %>% select(age_cat, sex, race_eth, ed_cat, indfmpir, indfmpir_cat,
-                                             insured, rxdcount, poly_cat, comorbidity_n, time_y, event)))
+# Modify headers for categorical table
+for (i in seq_along(poly_levels)) {
+  tbl_cat_exposure <- tbl_cat_exposure %>%
+    modify_header(
+      !!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ", 
+                                      format(n_by_poly[poly_levels[i]], big.mark = ","))
+    )
+}
+tbl_cat_exposure <- tbl_cat_exposure %>%
+  modify_header(
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  )
+
+tbl_exposure_merged <- tbl_stack(
+  tbls = list(tbl_cont_exposure, tbl_cat_exposure)
+) %>%
+  modify_caption("**Descriptive statistics by exposure (polypharmacy)**") %>%
+  modify_footnote(
+    update = all_stat_cols() ~
+      "N represents unweighted sample size. Continuous variables are survey-weighted; categorical variables are unweighted."
+  ) %>%
+  bold_labels()
+
+as_gt(tbl_exposure_merged)
 ```
 
+# Kaplan–Meier curves by polypharmacy
 
-## Table 1: Descriptive statistics
 ```{r}
-tbl1_by_outcome <- gtsummary::tbl_summary(
-  data = analytic_final,
-  by = event_f,
-  include = c(
-    poly_cat,              
-    rxdcount, age_cat, sex, race_eth, ed_cat, indfmpir_cat, insured,
-    comorbidity_n
-  ),
-  label = list(
-    age_cat     ~ "Age group",
-    sex           ~ "Sex",
-    race_eth      ~ "Race/ethnicity",
-    ed_cat        ~ "Education",
-    indfmpir_cat  ~ "Income-to-poverty ratio",
-    insured       ~ "Insurance coverage",
-    rxdcount      ~ "Medication count",
-    comorbidity_n ~ "Number of comorbidities",
-    poly_cat      ~ "Polypharmarcy"
-  ),
-  statistic = list(
-    all_continuous()  ~ "{mean} ({sd})",
-    all_categorical() ~ "{n} ({p}%)"
-  ),
-  missing = "ifany"
-) |>
-  gtsummary::bold_labels()
+# Unadjusted and unweighted KM
+km_unweighted <- survfit(Surv(time_y, event) ~ poly_cat, 
+                         data = d1$variables)
 
-tbl1_by_outcome
+km_df <- broom::tidy(km_unweighted) %>%
+    mutate(strata = gsub("poly_cat=", "", strata))
 
-tbl1_by_exposure <- gtsummary::tbl_summary(
-  data = analytic_final,
-  by = poly_cat,
-  include = c(
-    age_cat, sex, race_eth, ed_cat, indfmpir_cat, insured,
-    rxdcount, comorbidity_n, event_f
-  ),
-  label = list(
-    age_cat     ~ "Age group",
-    sex           ~ "Sex",
-    race_eth      ~ "Race/ethnicity",
-    ed_cat        ~ "Education",
-    indfmpir_cat  ~ "Income-to-poverty ratio",
-    insured       ~ "Insurance coverage",
-    rxdcount      ~ "Medication count",
-    comorbidity_n ~ "Number of comorbidities",
-    event_f       ~ "Mortality prevalence"
-  ),
-  statistic = list(
-    all_continuous()  ~ "{mean} ({sd})",
-    all_categorical() ~ "{n} ({p}%)"
-  ),
-  missing = "ifany"
-) |>
-  gtsummary::bold_labels()
-
-tbl1_by_exposure
+# Create a publication-quality KM plot
+ggplot(km_df, aes(x = time, y = estimate, color = strata)) +
+    geom_step(linewidth = 0.8) +
+    # Add confidence intervals as ribbons
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = strata),
+                alpha = 0.15, color = NA) +
+    # Add at-risk table grid lines
+    geom_hline(yintercept = c(0.25, 0.5, 0.75), 
+               linetype = "dashed", color = "gray80", linewidth = 0.3) +
+    labs(
+        title = "Kaplan–Meier Survival Curves by Polypharmacy Category",
+        x = "Time since baseline interview (years)", 
+        y = "Survival probability",
+        color = "Polypharmacy",
+        fill = "Polypharmacy"
+    ) +
+    scale_y_continuous(
+        limits = c(0, 1), 
+        labels = scales::percent_format(accuracy = 1),
+        breaks = seq(0, 1, 0.25)
+    ) +
+    scale_x_continuous(breaks = seq(0, max(km_df$time), by = 2)) +
+    scale_color_viridis_d(option = "D", end = 0.9) +
+    scale_fill_viridis_d(option = "D", end = 0.9) +
+    theme_minimal(base_size = 12) +
+    theme(
+        legend.position = "bottom",
+        legend.title = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 14),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "gray90", linewidth = 0.3)
+    ) +
+    guides(
+        color = guide_legend(nrow = 1),
+        fill = guide_legend(nrow = 1)
+    )
 ```
 
-## Cox PH models (survey-weighted): crude → basic → full, with a merged table
+# Cox PH models (MI pooled): crude → basic → full
+
+We fit each model across the **20 imputed datasets** and pool estimates (Rubin's rules). Reference exposure category is **1–4 medications**.
+
 ```{r}
-# Crude (exposure only)
-m_crude_svy <- svycoxph(Surv(time_y, event) ~ poly_cat, design = dsgn)
+# --- Pooled survey-weighted Cox models on multiply-imputed data ----
+# Helpers to (re)build analysis variables inside each completed dataset
+mk_indfmpir_cat <- function(indfmpir) {
+    forcats::fct_relevel(
+        dplyr::case_when(
+            is.na(indfmpir)              ~ NA_character_,
+            indfmpir < 1                 ~ "<1.00 (below poverty)",
+            indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
+            indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
+            indfmpir >= 4                ~ "≥4.00"
+        ),
+        "<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00"
+    )
+}
 
-# Basic (add demographics)
-m_basic_svy <- svycoxph(
-  Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth,
-  design = dsgn
-)
+mk_age_cat <- function(ridageyr) {
+    factor(dplyr::case_when(
+        ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+        ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+        ridageyr >= 80                 ~ "80 or above"
+    ), levels = c("45-64","65-79","80 or above"))
+}
 
-# Full planned model
-m_full_svy <- svycoxph(
-  Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
-    ed_cat + indfmpir_cat + insured + comorbidity_n,
-  design = dsgn
-)
+# Build a survey design but swallow any accidental printing
+quiet_design <- function(...) {
+    invisible(utils::capture.output(dd <- svydesign(...)))
+    dd
+}
 
-# Labels, per model (only include terms that appear in that model)
+# Fit models within each completed dataset (don't pool yet!)
+# — CRUDE (poly_cat only; ref = 1–4 meds) —
+fit_crude <- with(imp, {
+    di <- tibble::tibble(
+        sdmvpsu, sdmvstra, wtint_pool, time_y, event,
+        poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10"))
+    )
+    dd <- quiet_design(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                       nest = TRUE, data = di)
+    svycoxph(Surv(time_y, event) ~ poly_cat, design = dd)
+})
+
+# — BASIC (+ age/sex/race) —
+fit_basic <- with(imp, {
+    di <- tibble::tibble(
+        sdmvpsu, sdmvstra, wtint_pool, time_y, event,
+        poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+        age_cat  = mk_age_cat(ridageyr),
+        sex, race_eth
+    ) |> dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+    dd <- quiet_design(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                       nest = TRUE, data = di)
+    svycoxph(Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth, design = dd)
+})
+
+# — FULL (+ education, PIR, insurance, comorbidity, CCI, utilization) —
+fit_full <- with(imp, {
+    di <- tibble::tibble(
+        sdmvpsu, sdmvstra, wtint_pool, time_y, event,
+        poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+        age_cat  = mk_age_cat(ridageyr),
+        sex, race_eth, ed_cat, 
+        insured = factor(insured, levels = c("No", "Yes")),
+        indfmpir,
+        indfmpir_cat = mk_indfmpir_cat(indfmpir),
+        comorbidity_n = as.numeric(comorbidity_n),
+        cci_score     = as.numeric(cci_score),
+        visits_cat, hosp_stays_cat
+    ) |> dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+    dd <- quiet_design(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                       nest = TRUE, data = di)
+    svycoxph(
+        Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
+            ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+            visits_cat + hosp_stays_cat,
+        design = dd
+    )
+})
+
+# Variable labels
 labels_crude <- list(
-  poly_cat ~ "Polypharmacy"
+    poly_cat ~ "Polypharmacy"
 )
 
 labels_basic <- list(
-  poly_cat  ~ "Polypharmacy",
-  age_cat ~ "Age group",
-  sex       ~ "Sex",
-  race_eth  ~ "Race/ethnicity"
+    poly_cat  ~ "Polypharmacy",
+    age_cat   ~ "Age group",
+    sex       ~ "Sex",
+    race_eth  ~ "Race/ethnicity"
 )
 
 labels_full <- list(
-  poly_cat      ~ "Polypharmacy",
-  age_cat     ~ "Age group",
-  sex           ~ "Sex",
-  race_eth      ~ "Race/ethnicity",
-  ed_cat        ~ "Education",
-  indfmpir_cat  ~ "Income-to-poverty ratio",
-  insured       ~ "Insurance coverage",
-  comorbidity_n ~ "Number of comorbidities"
+    poly_cat       ~ "Polypharmacy",
+    age_cat        ~ "Age group",
+    sex            ~ "Sex",
+    race_eth       ~ "Race/ethnicity",
+    ed_cat         ~ "Education",
+    indfmpir_cat   ~ "Income-to-poverty ratio",
+    insured        ~ "Insurance coverage",
+    comorbidity_n  ~ "Number of comorbidities",
+    cci_score      ~ "Charlson-like comorbidity index",
+    visits_cat     ~ "Doctor visits in past year", 
+    hosp_stays_cat ~ "Hospital stays in past year"
 )
 
-# Build tables with intuitive labels
+# Create gtsummary tables for each model 
+# Suppress ALL output including console prints
+sink(tempfile())
 tbl_crude <- gtsummary::tbl_regression(
-  m_crude_svy, exponentiate = TRUE, label = labels_crude
-)
+    fit_crude,
+    exponentiate = TRUE,
+    label = labels_crude
+) %>%
+    gtsummary::bold_labels()
 
 tbl_basic <- gtsummary::tbl_regression(
-  m_basic_svy, exponentiate = TRUE, label = labels_basic
+    fit_basic,
+    exponentiate = TRUE,
+    label = labels_basic
+) %>%
+    gtsummary::bold_labels()
+
+tbl_full <- gtsummary::tbl_regression(
+    fit_full,
+    exponentiate = TRUE,
+    label = labels_full
+) %>%
+    gtsummary::bold_labels()
+sink()
+
+# Merge all three models into one table
+tbl_combined <- gtsummary::tbl_merge(
+    tbls = list(tbl_crude, tbl_basic, tbl_full),
+    tab_spanner = c("**Crude Model**", "**Basic Model**", "**Full Model**")
+) %>%
+    gtsummary::modify_caption("**Survey-weighted Cox proportional hazards models for all-cause mortality**") %>%
+    gtsummary::modify_footnote(
+        update = gtsummary::all_stat_cols() ~ 
+            "HR = hazard ratio; CI = confidence interval. Models account for complex survey design and multiple imputation. Reference category for polypharmacy is 1–4 medications."
+    ) %>%
+    gtsummary::bold_labels()
+
+# Convert to gt for additional customization if needed
+tbl_combined_gt <- gtsummary::as_gt(tbl_combined) %>%
+    gt::tab_source_note(
+        gt::md("**Notes.** Crude model: unadjusted. Basic model: adjusted for age, sex, and race/ethnicity. Full model: additionally adjusted for education, income-to-poverty ratio, insurance, comorbidities, and healthcare utilization.")
+    )
+
+# Print the combined table
+tbl_combined_gt
+```
+
+# Stratification descriptive statistics by therapeutic-class
+```{r}
+# ---- Descriptives by exposure within therapeutic-class user cohorts ----------
+# Uses imputation #1; unweighted N in headers; weighted continuous / unweighted categorical
+
+# classes to analyze (must exist in rx_all)
+rx_targets <- c("rx_antineoplastic", "rx_cns", "rx_cardiovascular", "rx_psychotherapeutic")
+rx_targets <- intersect(rx_targets, names(rx_all))
+
+rx_pretty <- c(
+  rx_antineoplastic    = "Antineoplastic agents",
+  rx_cns               = "CNS agents",
+  rx_cardiovascular    = "Cardiovascular agents",
+  rx_psychotherapeutic = "Psychotherapeutic agents"
 )
 
-tbl_full  <- gtsummary::tbl_regression(
-  m_full_svy,  exponentiate = TRUE, label = labels_full
+# labels reused
+lbl_cont <- list(
+  rxdcount        ~ "Medication count",
+  comorbidity_n   ~ "Number of comorbidities",
+  cci_score       ~ "Charlson-like comorbidity score"
+)
+lbl_cat <- list(
+  event_f        ~ "Mortality status",
+  age_cat        ~ "Age group",
+  sex            ~ "Sex",
+  race_eth       ~ "Race/ethnicity",
+  ed_cat         ~ "Education",
+  indfmpir_cat   ~ "Income-to-poverty ratio",
+  insured        ~ "Insurance coverage",
+  visits_cat     ~ "Doctor visits in past year",
+  hosp_stays_cat ~ "Hospital stays in past year"
 )
 
-# Create a side-by-side table
-models_merged <- gtsummary::tbl_merge(
-  tbls = list(tbl_crude, tbl_basic, tbl_full),
-  tab_spanner = c("**Crude**", "**Basic (Age/Sex/Race)**", "**Full**")
-) |>
-  gtsummary::bold_labels()
+# helpers (as before)
+mk_indfmpir_cat <- function(indfmpir) {
+  forcats::fct_relevel(
+    dplyr::case_when(
+      is.na(indfmpir)              ~ NA_character_,
+      indfmpir < 1                 ~ "<1.00 (below poverty)",
+      indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
+      indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
+      indfmpir >= 4                ~ "≥4.00"
+    ),
+    "<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00"
+  )
+}
+mk_age_cat <- function(ridageyr) {
+  factor(dplyr::case_when(
+    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+    ridageyr >= 80                 ~ "80 or above"
+  ), levels = c("45-64","65-79","80 or above"))
+}
+ensure_ref_14 <- function(f) {
+  f <- forcats::fct_drop(f)
+  if ("1–4" %in% levels(f) && any(f == "1–4")) forcats::fct_relevel(f, "1–4") else f
+}
 
-models_merged
+# imputed dataset #1 for descriptives
+di1 <- complete(imp, 1)
+
+# builder for ONE class cohort → gt table (exposure-stratified)
+build_desc_subsample_exposure <- function(flag) {
+  # attach class flag (0/1) and subset to users
+  dat_sub <- di1 %>%
+    dplyr::mutate(
+      class_flag = dplyr::coalesce(as.integer(rx_all[[flag]][match(seqn, rx_all$seqn)]), 0L)
+    ) %>%
+    dplyr::filter(class_flag == 1L) %>%
+    dplyr::mutate(
+      poly_cat       = ensure_ref_14(factor(poly_cat, levels = c("1–4","0","5–9","≥10"))),
+      age_cat        = mk_age_cat(ridageyr),
+      indfmpir_cat   = mk_indfmpir_cat(indfmpir),
+      event_f        = factor(event, levels = c(0,1), labels = c("Alive/Censored","Deceased")),
+      rxdcount       = as.numeric(rxdcount),
+      comorbidity_n  = as.numeric(comorbidity_n),
+      cci_score      = as.numeric(cci_score)
+    )
+
+  # unweighted N for headers
+  n_overall  <- nrow(dat_sub)
+  poly_levels <- levels(dat_sub$poly_cat)
+  n_by_poly  <- table(dat_sub$poly_cat)
+
+  # survey design (quiet)
+  invisible(utils::capture.output(
+    d_sub <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                       nest = TRUE, data = dat_sub)
+  ))
+
+  cont_vars <- c("rxdcount","comorbidity_n","cci_score")
+
+  # ----- Continuous (weighted), by poly_cat -----
+  tbl_cont <- tbl_svysummary(
+    data       = d_sub,
+    by         = poly_cat,
+    include    = all_of(intersect(cont_vars, names(d_sub$variables))),
+    statistic  = list(all_continuous() ~ "{mean} ({sd})"),
+    missing    = "no",
+    label      = lbl_cont
+  ) %>%
+    add_overall() %>%
+    bold_labels()
+
+  # set unweighted N in headers for continuous
+  for (i in seq_along(poly_levels)) {
+    tbl_cont <- tbl_cont %>%
+      modify_header(
+        !!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ",
+                                       format(n_by_poly[poly_levels[i]], big.mark = ","))
+      )
+  }
+  tbl_cont <- tbl_cont %>%
+    modify_header(
+      stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+    )
+
+  # ----- Categorical (unweighted), by poly_cat -----
+  tbl_cat <- tbl_summary(
+    data       = dat_sub,
+    by         = poly_cat,
+    include    = all_of(intersect(
+      c("event_f","age_cat","sex","race_eth","ed_cat",
+        "indfmpir_cat","insured","visits_cat","hosp_stays_cat"),
+      names(dat_sub)
+    )),
+    type       = list(all_categorical() ~ "categorical"),
+    statistic  = list(all_categorical() ~ "{n} ({p}%)"),
+    missing    = "no",
+    label      = lbl_cat
+  ) %>%
+    add_overall(last = TRUE) %>%
+    bold_labels()
+
+  # set unweighted N in headers for categorical
+  for (i in seq_along(poly_levels)) {
+    tbl_cat <- tbl_cat %>%
+      modify_header(
+        !!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ",
+                                       format(n_by_poly[poly_levels[i]], big.mark = ","))
+      )
+  }
+  tbl_cat <- tbl_cat %>%
+    modify_header(
+      stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+    )
+
+  # ----- Stack & print -----
+  tbl_merged <- tbl_stack(
+    tbls = list(tbl_cont, tbl_cat)
+  ) %>%
+    modify_caption(paste0("**Descriptive statistics by exposure — ", rx_pretty[flag], " users (imputation #1)**")) %>%
+    modify_footnote(
+      update = all_stat_cols() ~
+        "N represents unweighted sample size. Continuous variables are summarized with survey-weighted mean (SD). Categorical variables are summarized with unweighted n (column %)."
+    ) %>%
+    bold_labels()
+
+  as_gt(tbl_merged)
+}
+
+# build all four tables
+desc_tables_sub_exposure <- purrr::imap(rx_targets, ~ build_desc_subsample_exposure(.x))
+
+# show them
+desc_tables_sub_exposure[[1]]
+desc_tables_sub_exposure[[2]]
+desc_tables_sub_exposure[[3]]
+desc_tables_sub_exposure[[4]]
 ```
 
 
-## Sensitivity: treat polypharmacy as continuous with natural cubic spline in the full model
+# Stratification models by therapeutic-class
 ```{r}
-# Literature often places knots around 5 and 10 medications.
-# We fit the full covariate set, replacing poly_cat with ns(rxdcount, knots=c(5,10))
-m_spline_svy <- svycoxph(
-  Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5, 10)) +
-    age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured + comorbidity_n,
-  design = dsgn
+# ---- Full models in therapeutic-class user sub-samples (MI-pooled) -----------
+
+# classes to analyze (must exist in rx_all)
+rx_targets <- c("rx_antineoplastic", "rx_cns", "rx_cardiovascular", "rx_psychotherapeutic")
+rx_targets <- intersect(rx_targets, names(rx_all))
+
+rx_pretty <- c(
+    rx_antineoplastic    = "Antineoplastic agents",
+    rx_cns               = "CNS agents",
+    rx_cardiovascular    = "Cardiovascular agents",
+    rx_psychotherapeutic = "Psychotherapeutic agents"
 )
 
-# Global design-based Wald test for the overall (possibly non-linear) effect of rxdcount
-glob_test <- survey::regTermTest(m_spline_svy, ~ splines::ns(rxdcount, knots = c(5, 10)))
-cat("\nGlobal test for spline(rxdcount) (design-based Wald):\n")
-print(glob_test)
-
-# Make the spline interpretable: adjusted HR curve vs rxdcount = 0
-#    Build a simple reference profile from typical values (median/mode)
-Mode <- function(x) names(sort(table(x), decreasing = TRUE))[1]
-
-ref_row <- tibble::tibble(
-  age_cat     = factor(Mode(analytic_final$age_cat), levels = levels(analytic_final$age_cat)),
-  sex           = factor(Mode(analytic_final$sex), levels = levels(analytic_final$sex)),
-  race_eth      = factor(Mode(analytic_final$race_eth), levels = levels(analytic_final$race_eth)),
-  ed_cat        = factor(Mode(analytic_final$ed_cat), levels = levels(analytic_final$ed_cat)),
-  indfmpir_cat  = factor(Mode(analytic_final$indfmpir_cat), levels = levels(analytic_final$indfmpir_cat)),
-  insured       = factor(Mode(analytic_final$insured), levels = levels(analytic_final$insured)),
-  comorbidity_n = median(analytic_final$comorbidity_n, na.rm = TRUE)
+# labels for the gtsummary output
+labels_full <- list(
+    poly_cat       ~ "Polypharmacy",
+    age_cat        ~ "Age group",
+    sex            ~ "Sex",
+    race_eth       ~ "Race/ethnicity",
+    ed_cat         ~ "Education",
+    indfmpir_cat   ~ "Income-to-poverty ratio",
+    insured        ~ "Insurance coverage",
+    comorbidity_n  ~ "Number of comorbidities",
+    cci_score      ~ "Charlson-like comorbidity index",
+    visits_cat     ~ "Doctor visits in past year",
+    hosp_stays_cat ~ "Hospital stays in past year"
 )
 
-# Prediction grid across medication counts
-grid <- tidyr::crossing(rxdcount = 0:25, ref_row)
-
-# Predict linear predictors
-p_out <- tryCatch(
-  predict(m_spline_svy, newdata = grid, type = "lp", se.fit = TRUE),
-  error = function(e) NULL
-)
-
-if (is.null(p_out)) {
-  lp_vec <- as.numeric(predict(m_spline_svy, newdata = grid, type = "lp"))
-  se_lp  <- rep(NA_real_, length(lp_vec))
-} else {
-  if (is.list(p_out)) {
-    lp_vec <- as.numeric(p_out$fit)
-    se_lp  <- as.numeric(p_out$se.fit)
-  } else {
-    lp_vec <- as.numeric(p_out)
-    se_lp  <- rep(NA_real_, length(lp_vec))
-  }
+# helpers to (re)derive analysis factors inside each completed dataset
+mk_indfmpir_cat <- function(indfmpir) {
+    forcats::fct_relevel(
+        dplyr::case_when(
+            is.na(indfmpir)              ~ NA_character_,
+            indfmpir < 1                 ~ "<1.00 (below poverty)",
+            indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
+            indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
+            indfmpir >= 4                ~ "≥4.00"
+        ),
+        "<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00"
+    )
+}
+mk_age_cat <- function(ridageyr) {
+    factor(dplyr::case_when(
+        ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+        ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+        ridageyr >= 80                 ~ "80 or above"
+    ), levels = c("45-64","65-79","80 or above"))
 }
 
-grid <- grid %>%
+# ensure "1–4" is the reference *if present*, otherwise leave alone
+ensure_ref_14 <- function(f) {
+    f <- forcats::fct_drop(f)
+    if ("1–4" %in% levels(f) && any(f == "1–4")) forcats::fct_relevel(f, "1–4") else f
+}
+
+# fit one full model per class among users (flag == 1) across imputations
+fit_full_subsample <- function(flag) {
+    with(imp, {
+        # current completed dataset as a tibble
+        di <- tibble::tibble(
+            seqn, sdmvpsu, sdmvstra, wtint_pool,
+            time_y, event, ridageyr, sex, race_eth, ed_cat, insured,
+            comorbidity_n = as.numeric(comorbidity_n),
+            cci_score     = as.numeric(cci_score),
+            rxdcount      = as.numeric(rxdcount),
+            visits_cat, hosp_stays_cat,
+            poly_cat, indfmpir
+        )
+        
+        # add the class flag (0/1) from rx_all and subset to users
+        di[[flag]] <- dplyr::coalesce(as.integer(rx_all[[flag]][match(di$seqn, rx_all$seqn)]), 0L)
+        di <- dplyr::filter(di, .data[[flag]] == 1L)
+        
+        # (!!) everyone here is on >=1 med; drop level "0" from poly_cat
+        di <- di %>%
+            dplyr::mutate(
+                poly_cat      = ensure_ref_14(factor(poly_cat, levels = c("1–4","0","5–9","≥10"))),
+                age_cat       = mk_age_cat(ridageyr),
+                indfmpir_cat  = mk_indfmpir_cat(indfmpir),
+                sex            = forcats::fct_drop(sex),
+                race_eth       = forcats::fct_drop(race_eth),
+                ed_cat         = forcats::fct_drop(ed_cat),
+                indfmpir_cat   = forcats::fct_drop(indfmpir_cat),
+                insured        = forcats::fct_drop(insured),
+                visits_cat     = forcats::fct_drop(visits_cat),
+                hosp_stays_cat = forcats::fct_drop(hosp_stays_cat)
+            )
+        
+        # survey design (quiet)
+        invisible(utils::capture.output(
+            dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                            nest = TRUE, data = di)
+        ))
+        
+        svycoxph(
+            Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
+                ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+                visits_cat + hosp_stays_cat,
+            design = dd
+        )
+    })
+}
+
+# pool → tidy (HR scale) → safe p-values → gtsummary-friendly
+tidy_mipo_for_gts <- function(fits_mira, exponentiate = TRUE) {
+    po <- pool(fits_mira)
+    sm <- summary(po, conf.int = TRUE, conf.level = 0.95)
+    
+    # standardize column names across mice versions
+    if (!"conf.low" %in% names(sm) && "2.5 %" %in% names(sm)) {
+        sm <- dplyr::rename(sm, conf.low = `2.5 %`, conf.high = `97.5 %`)
+    }
+    
+    # pick the existing p column safely
+    pcol <- intersect(c("p.value", "Pr(>|t|)"), names(sm))
+    if (length(pcol) == 0) {
+        sm$p.value <- NA_real_
+    } else {
+        sm$p.value <- sm[[pcol[1]]]
+    }
+    
+    if (exponentiate) {
+        sm <- dplyr::mutate(sm,
+                            estimate = exp(estimate),
+                            conf.low = exp(conf.low),
+                            conf.high = exp(conf.high)
+        )
+    }
+    
+    dplyr::select(sm, term, estimate, conf.low, conf.high, p.value)
+}
+
+tbl_from_mira <- function(fits_mira, title, labels) {
+    sm <- tidy_mipo_for_gts(fits_mira, TRUE)
+    placeholder <- fits_mira$analyses[[1]]
+    tbl_regression(
+        x = placeholder,
+        exponentiate = TRUE,
+        label = labels,
+        tidy_fun = function(...) sm
+    ) %>%
+        modify_header(label ~ paste0("**", title, "**")) %>%
+        bold_labels()
+}
+
+# fit all four sub-samples
+fits_sub <- purrr::map(rx_targets, fit_full_subsample)
+names(fits_sub) <- rx_targets
+
+# Suppress ALL output including console prints
+sink(tempfile())
+# render gtsummary tables (one per class)
+tbls_sub <- purrr::imap(
+    fits_sub,
+    ~ tbl_from_mira(.x, paste0("Full model among ", rx_pretty[.y]), labels_full)
+)
+
+sink()
+# inspect individual tables
+tbls_sub
+
+# or stack into a single display
+tbl_sub_stacked <- tbl_stack(
+    tbls = unname(tbls_sub),
+    group_header = unname(rx_pretty[rx_targets])
+) %>%
+    modify_caption("**MI-pooled, survey-weighted Cox models within therapeutic-class user sub-samples**") %>%
+    bold_labels()
+
+tbl_sub_stacked
+```
+
+
+# Sensitivity 1: Continuous exposure (spline), 0‑meds reference (MI pooled)
+
+We fit `svycoxph` with a natural cubic spline for `rxdcount` (knots 5 & 10), pool **coefficients & covariance** across imputations, then use the **delta method** to plot HRs and 95% CIs **relative to 0 medications** for a **survey‑weighted reference profile** (modes/medians).
+
+```{r}
+# Fit spline model on each imputed dataset, collect coef & vcov
+fit_list <- lapply(design_list, function(dd) {
+  # ensure factor levels
+  dd <- update(dd, 
+               poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+               insured = factor(insured, levels = c("No", "Yes")))
+  svycoxph(Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5,10)) +
+             age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
+             comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+           design = dd)
+})
+
+coefs <- lapply(fit_list, coef)
+vcovs <- lapply(fit_list, vcov)
+
+# Rubin pooling via mitools
+mi_pool <- MIcombine(coefs, vcovs)
+beta <- mi_pool$coefficients
+V    <- mi_pool$variance
+coef_nm <- names(beta)
+
+# Build a reference profile from imputed dataset #1 (weighted modes/medians)
+d1 <- design_list[[1]]
+svy_median <- function(des, var) {
+  q <- svyquantile(as.formula(paste0("~", var)), des, quantiles = 0.5, na.rm = TRUE, ci = FALSE)
+  as.numeric(coef(q))
+}
+svy_mode <- function(des, var) {
+  tb <- svytable(as.formula(paste0("~", var)), des)
+  nm <- names(tb); nm[which.max(as.numeric(tb))]
+}
+
+dat1 <- d1$variables
+
+# Get the mode values as character first
+ref_age_cat_val    <- svy_mode(d1, "age_cat")
+ref_sex_val        <- svy_mode(d1, "sex")
+ref_race_val       <- svy_mode(d1, "race_eth")
+ref_ed_val         <- svy_mode(d1, "ed_cat")
+ref_pir_cat_val    <- svy_mode(d1, "indfmpir_cat")
+ref_insured_val    <- svy_mode(d1, "insured")
+ref_visits_val     <- svy_mode(d1, "visits_cat")
+ref_hosp_stays_val <- svy_mode(d1, "hosp_stays_cat")
+ref_comorb_n       <- svy_median(d1, "comorbidity_n")
+ref_cci            <- svy_median(d1, "cci_score")
+
+# Prediction grid - create base row with proper factor levels
+pred_grid_base <- tibble(
+    rxdcount       = 0,
+    age_cat        = factor(ref_age_cat_val, levels = levels(dat1$age_cat)),
+    sex            = factor(ref_sex_val, levels = levels(dat1$sex)),
+    race_eth       = factor(ref_race_val, levels = levels(dat1$race_eth)),
+    ed_cat         = factor(ref_ed_val, levels = levels(dat1$ed_cat)),
+    indfmpir_cat   = factor(ref_pir_cat_val, levels = levels(dat1$indfmpir_cat)),
+    insured        = factor(ref_insured_val, levels = levels(dat1$insured)),
+    comorbidity_n  = ref_comorb_n,
+    cci_score      = ref_cci,
+    visits_cat     = factor(ref_visits_val, levels = levels(dat1$visits_cat)),
+    hosp_stays_cat = factor(ref_hosp_stays_val, levels = levels(dat1$hosp_stays_cat))
+)
+
+# Now expand to all medication counts while preserving factor levels
+pred_grid <- pred_grid_base %>%
+    slice(rep(1, 26)) %>%  # Replicate the row 26 times
+    mutate(rxdcount = 0:25)
+
+# Create terms, model.frame, and model.matrix consistent with pooled fit
+TT_full <- terms(fit_list[[1]])
+TT_noy  <- delete.response(TT_full)
+
+mf_grid <- model.frame(TT_noy, data = pred_grid,
+                       xlev = fit_list[[1]]$xlevels, na.action = na.pass)
+X <- model.matrix(TT_noy, mf_grid)
+
+# Align columns to pooled coef names
+X <- X[, coef_nm, drop = FALSE]
+
+# Reference row: same profile but rxdcount = 0 (already true for row 1)
+X_ref <- X[1, , drop = FALSE]
+
+Delta  <- X - matrix(X_ref, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)
+lp     <- as.vector(Delta %*% beta)
+se_lp  <- sqrt(pmax(0, rowSums((Delta %*% V) * Delta)))
+
+pred_df <- pred_grid %>%
   mutate(
-    lp    = lp_vec,
-    se_lp = se_lp,
-    lp0   = lp[rxdcount == 0],                 # reference at 0 medications
-    HR      = exp(lp - lp0),                   # hazard ratio vs 0
-    HR_low  = ifelse(is.na(se_lp), NA_real_, exp((lp - 1.96*se_lp) - lp0)),
-    HR_high = ifelse(is.na(se_lp), NA_real_, exp((lp + 1.96*se_lp) - lp0))
+    HR  = exp(lp),
+    LCL = exp(lp - 1.96 * se_lp),
+    UCL = exp(lp + 1.96 * se_lp)
   )
 
-# Plot: adjusted HR vs medication count (ribbon shown only if SEs available)
-p <- ggplot(grid, aes(x = rxdcount, y = HR)) +
-  geom_line() +
-  { if (all(is.na(grid$HR_low))) NULL else geom_ribbon(aes(ymin = HR_low, ymax = HR_high), alpha = 0.20) } +
+# Create the plot
+p_spline <- ggplot(pred_df, aes(x = rxdcount, y = HR)) +
+  geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = 2, color = "gray50") +
   labs(
-    title = "Adjusted hazard ratio vs. medication count (spline; knots at 5 & 10)",
-    x = "Medication count (past 30 days)",
-    y = "Hazard Ratio (ref = 0 medications)"
+    title = "Adjusted HR vs medication count (MI pooled)",
+    subtitle = "Natural spline (knots 5 & 10). Reference = 0 medications.",
+    x = "Medication count", 
+    y = "Hazard Ratio (95% CI)"
   ) +
-  theme_minimal()
+  scale_y_continuous(trans = "log10", breaks = c(0.5, 1, 2, 3, 5, 10)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
 
-print(p)
+# Display it
+print(p_spline)
 
-# HR table at useful counts (relative to 0 meds)
-at_counts <- tibble::tibble(rxdcount = c(0, 2, 5, 7, 10, 15, 20)) %>% tidyr::crossing(ref_row)
+```
 
-p_out2 <- tryCatch(
-  predict(m_spline_svy, newdata = at_counts, type = "lp", se.fit = TRUE),
-  error = function(e) NULL
-)
+# Sensitivity 2: Restrict to multimorbidity (comorbidity_n ≥ 2)
 
-if (is.null(p_out2)) {
-  lp2 <- as.numeric(predict(m_spline_svy, newdata = at_counts, type = "lp"))
-  se2 <- rep(NA_real_, length(lp2))
-} else {
-  if (is.list(p_out2)) {
-    lp2 <- as.numeric(p_out2$fit)
-    se2 <- as.numeric(p_out2$se.fit)
-  } else {
-    lp2 <- as.numeric(p_out2)
-    se2 <- rep(NA_real_, length(lp2))
-  }
-}
+```{r}
+# Sensitivity 2: Restrict to multimorbidity (comorbidity_n ≥ 2)
 
-hr_table <- at_counts %>%
-  mutate(
-    lp  = lp2,
-    se  = se2,
-    lp0 = lp[rxdcount == 0],
-    HR     = exp(lp - lp0),
-    HR_lo  = ifelse(is.na(se), NA_real_, exp((lp - 1.96*se) - lp0)),
-    HR_hi  = ifelse(is.na(se), NA_real_, exp((lp + 1.96*se) - lp0))
+fit_multi <- with(imp, {
+  di <- tibble::tibble(
+    sdmvpsu, sdmvstra, wtint_pool, time_y, event,
+    ridageyr,
+    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+    age_cat = factor(case_when(
+      ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+      ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+      ridageyr >= 80                 ~ "80 or above"),
+      levels = c("45-64","65-79","80 or above")),
+    sex, race_eth, ed_cat,
+    insured = factor(insured, levels = c("No", "Yes")),
+    indfmpir,
+    indfmpir_cat = mk_indfmpir_cat(indfmpir),
+    comorbidity_n = as.numeric(comorbidity_n),
+    cci_score = as.numeric(cci_score),
+    visits_cat, hosp_stays_cat
   ) %>%
-  select(rxdcount, HR, HR_lo, HR_hi)
+    filter(comorbidity_n >= 2) %>%
+    dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+  
+  dd <- quiet_design(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                     nest = TRUE, data = di)
+  svycoxph(Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
+              ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+              visits_cat + hosp_stays_cat,
+           design = dd)
+})
 
-cat("\nAdjusted hazard ratios at selected medication counts (vs 0 meds):\n")
-print(hr_table)
+# Create gtsummary table for sensitivity analysis
+sink(tempfile())
+tbl_multi <- gtsummary::tbl_regression(
+    fit_multi,
+    exponentiate = TRUE,
+    label = labels_full
+) %>%
+    gtsummary::modify_caption("**Sensitivity analysis: Restricted to multimorbidity (≥2 comorbidities)**") %>%
+    gtsummary::bold_labels()
+sink()
 
-# gtsummary model table with clear labels and a global p-value for the spline term
-nice_labels <- list(
-  `splines::ns(rxdcount, knots = c(5, 10))` ~ "Medication count (spline; knots 5 & 10)",
-  age_cat     ~ "Age group",
-  sex           ~ "Sex",
-  race_eth      ~ "Race/ethnicity",
-  ed_cat        ~ "Education",
-  indfmpir_cat  ~ "Income-to-poverty ratio",
-  insured       ~ "Insurance coverage",
-  comorbidity_n ~ "Number of comorbidities"
-)
+as_gt(tbl_multi)
+```
 
-spline_tbl <- gtsummary::tbl_regression(
-  m_spline_svy, exponentiate = TRUE, label = nice_labels
-) |>
-  gtsummary::add_global_p(terms = "splines::ns(rxdcount, knots = c(5, 10))") |>
-  gtsummary::bold_labels() |>
-  gtsummary::modify_header(label ~ "**Full model with rxdcount spline**")
+# Sensitivity 3: Exclude external‑cause deaths (ucod_leading 4 or 10)
 
-spline_tbl
+We repeat the **full model** after **excluding deaths due to external causes** (e.g., injuries or accidents), operationalized as `ucod_leading %in% c(4, 10)` among deaths.
+
+```{r}
+fit_no_external <- with(imp, {
+  di <- tibble::tibble(
+    sdmvpsu, sdmvstra, wtint_pool, time_y, event, ucod_leading,
+    ridageyr,
+    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+    age_cat = factor(case_when(
+      ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+      ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+      ridageyr >= 80                 ~ "80 or above"),
+      levels = c("45-64","65-79","80 or above")),
+    sex, race_eth, ed_cat,
+    insured = factor(insured, levels = c("No", "Yes")),
+    indfmpir,
+    indfmpir_cat = mk_indfmpir_cat(indfmpir),
+    comorbidity_n = as.numeric(comorbidity_n),
+    cci_score = as.numeric(cci_score),
+    visits_cat, hosp_stays_cat
+  ) %>%
+    # Exclude external-cause deaths: (event==1 & ucod_leading in {4,10})
+    filter(!(event == 1 & ucod_leading %in% c(4, 10))) %>%
+    dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+  
+  dd <- quiet_design(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                     nest = TRUE, data = di)
+  svycoxph(Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
+              ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+              visits_cat + hosp_stays_cat,
+           design = dd)
+})
+
+# Create gtsummary table for sensitivity analysis
+sink(tempfile())
+tbl_no_external <- gtsummary::tbl_regression(
+    fit_no_external,
+    exponentiate = TRUE,
+    label = labels_full
+) %>%
+    gtsummary::modify_caption("**Sensitivity analysis: Excluding external-cause deaths**") %>%
+    gtsummary::bold_labels()
+sink()
+
+as_gt(tbl_no_external)
 ```
 
