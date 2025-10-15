@@ -1,13 +1,13 @@
 ---
 title: 'SPPH604: Statistical Analysis Plan Analytic Code'
 author: "Teal Green (Alexi, Alex, Ezra)"
-date: "2025-09-28"
+date: "2025-10-13"
 output:
-  html_document:
-    df_print: paged
+  word_document: default
   pdf_document:
     latex_engine: xelatex
-  word_document: default
+  html_document:
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
@@ -302,13 +302,52 @@ rx_all <- demo_roster %>%
 # Target item names after clean_names() (all lower case)
 comorb_vars <- c(
   # MCQ (ever told …)
-  "mcq010","mcq080","mcq160a","mcq160n","mcq160b","mcq160c","mcq160d",
+  "mcq010","mcq080","mcq160n","mcq160b","mcq160c","mcq160d",
   "mcq160e","mcq160f","mcq160m","mcq160g","mcq160k","mcq160l","mcq220",
   # Other modules
   "diq010",  # diabetes
   "bpq020",  # hypertension
-  "kiq022"   # kidney disease
+  "kiq022",   # kidney disease
+  # Some additions
+  "diq080", # diabetes with retinopathy
+  "mcq190", # rheumatoid arthritis 2003/4 to 2007/8 to replace arthritis of any kind ("mcq160a")
+  "mcq191", # rheumatoid arthritis 2009/10 to replace arthritis of any kind ("mcq160a")
+  "mcq195" # rheumatoid arthritis 2011/12 to 2017/18 to replace arthritis of any kind ("mcq160a")
 )
+
+comorb_vars_reduced <- c(
+  "mcq010","mcq080","mcq160n","mcq160b","mcq160c","mcq160d",
+  "mcq160e","mcq160f","mcq160m","mcq160g","mcq160k","mcq160l","mcq220",
+  "bpq020",  
+  "kiq022",   
+  "diq_noret",
+  "diq_ret", 
+  "mcq_ra" 
+)
+
+## Create weights
+comorb_weights <- c(
+  
+  mcq010 = 0 ,
+  mcq080 = 0 ,
+  mcq160n = 0 ,
+  mcq160b = 1,
+  mcq160c = 0,
+  mcq160d = 0,
+  mcq160e = 1,
+  mcq160f = 1,
+  mcq160m = 0,
+  mcq160g = 1,
+  mcq160k = 1,
+  mcq160l = 2,
+  mcq220 = 2,
+  diq_noret = 1,  # diabetes needs a recode for diq080 and diq010 first
+  diq_ret = 2,  # diabetes needs a recode for diq080 and diq010 first
+  bpq020 = 0 ,  
+  kiq022 = 2,   
+  mcq_ra = 1
+)
+  
 # Include 16 conditions: angina pectoris, arthritis, asthma, chronic bronchitis, congestive heart failure, coronary heart disease, diabetes, emphysema, gout, hypertension, liver condition, myocardial infarction, obesity, stroke, thyroid problems, and kidney disease
 
 # Pull each module across cycles
@@ -320,7 +359,7 @@ mcq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
 
 diq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
   df <- safe_get("DIQ", .x)
-  if ("diq010" %in% names(df)) dplyr::select(df, seqn, diq010) else tibble(seqn = df$seqn)
+  if ("diq010" %in% names(df)) dplyr::select(df, seqn, diq010, diq080) else tibble(seqn = df$seqn)
 })
 
 bpq_wide <- purrr::map_dfr(cycle_meta$suffix, ~{
@@ -345,11 +384,44 @@ for (v in comorb_vars) {
   if (!v %in% names(health_wide)) health_wide[[v]] <- NA
 }
 
-# Recode to 1/0 and sum across items
-mcq_clean <- health_wide %>%
-  dplyr::mutate(dplyr::across(dplyr::all_of(comorb_vars), yes1_else0)) %>%
-  dplyr::mutate(comorbidity_n = rowSums(dplyr::across(dplyr::all_of(comorb_vars)), na.rm = TRUE)) %>%
-  dplyr::select(seqn, comorbidity_n)
+# Create diabetes column and a rheumatoid arthritis column
+health_wide <- health_wide %>%
+ mutate(
+    diq_noret = case_when(
+      diq010 == "Yes" & diq080 == "No" ~ "Yes",          # diabetes, no retinopathy
+      diq010 == "Yes" & diq080 == "Yes" ~ "No",          # diabetes, with retinopathy
+      diq010 == "No" ~ "No",                        # no diabetes
+      TRUE ~ NA_character_
+    ),
+    diq_ret = case_when(
+      diq010 == "Yes" & diq080 == "Yes" ~ "Yes",          # diabetes, retinopathy
+      diq010 == "Yes" & diq080 == "No" ~ "No",          # diabetes, no retinopathy
+      diq010 == "No" ~ "No",                        # no diabetes
+      TRUE ~ NA_character_
+    ),
+    mcq_ra = case_when(
+        mcq190 == "Rheumatoid arthritis"  ~ "Yes",
+        mcq191 == "Rheumatoid arthritis"  ~ "Yes", 
+        mcq195 == "Rheumatoid arthritis"  ~ "Yes",
+        TRUE ~ NA_character_
+    )
+  )
+
+# Recode to 1/0 first
+health_num <- health_wide %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(comorb_vars_reduced), yes1_else0))
+
+# Compute count by sum, calculate weighted sum 
+comorb_matrix <- as.matrix(health_num[dplyr::all_of(comorb_vars_reduced)])
+weights_vec <- unlist(comorb_weights[comorb_vars_reduced])
+
+mcq_clean <- health_num %>%
+  dplyr::mutate(
+    comorbidity_n = rowSums(comorb_matrix, na.rm = TRUE),
+    comorbidity_cci = as.numeric(comorb_matrix %*% weights_vec)
+  ) %>%
+  dplyr::select(seqn, comorbidity_n, comorbidity_cci)
+
 
 # Insurance: HIQ011 -> Yes/No/Unknown
 hiq_all <- purrr::map_dfr(cycle_meta$suffix, ~{
@@ -402,7 +474,7 @@ df45 <- raw %>%
       !is.na(rxdcount) & rxdcount >= 5 & rxdcount <= 9 ~ "5–9",
       !is.na(rxdcount) & rxdcount >= 10       ~ "≥10",
       TRUE ~ NA_character_
-    ) %>% factor(levels = c("0", "1–4","5–9","≥10")),
+    ) %>% factor(levels = c("0","1–4","5–9","≥10")),
 
     # core demo + SES
     age_cat = case_when(
@@ -727,4 +799,3 @@ spline_tbl <- gtsummary::tbl_regression(
 
 spline_tbl
 ```
-
