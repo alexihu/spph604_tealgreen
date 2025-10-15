@@ -3,11 +3,11 @@ title: 'SPPH604: Statistical Analysis Plan Analytic Code'
 author: "Teal Green (Alexi, Alex, Ezra)"
 date: "2025-09-28"
 output:
-  word_document: default
-  pdf_document:
-    latex_engine: xelatex
   html_document:
     df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -402,7 +402,7 @@ df45 <- raw %>%
       !is.na(rxdcount) & rxdcount >= 5 & rxdcount <= 9 ~ "5–9",
       !is.na(rxdcount) & rxdcount >= 10       ~ "≥10",
       TRUE ~ NA_character_
-    ) %>% factor(levels = c("0","1–4","5–9","≥10")),
+    ) %>% factor(levels = c("0", "1–4","5–9","≥10")),
 
     # core demo + SES
     age_cat = case_when(
