@@ -519,8 +519,8 @@ parse_hud080_1to6 <- function(x) {
   as.integer(out)
 }
 
-visits_lab   <- c("0 visits","1 visit","2–3 visits","4–9 visits","10–12 visits","≥13 visits")
-hosp_labels  <- c("0 stays","1 stay","2 stays","3 stays","4 stays","5 stays","≥6 stays")
+visits_lab     <- c("0 visits","1 visit","2–3 visits","4–9 visits","10–12 visits","≥13 visits")
+hosp_labels   <- c("0 stays","1 stay","2–3 stays","≥4 stays") 
 
 huq_util <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
   df <- safe_get("HUQ", suf)
@@ -551,7 +551,17 @@ huq_util <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
     is.na(yn) & !is.na(h80) ~ as.integer(h80),   # gentle inference if HUQ071 missing
     TRUE ~ NA_integer_
   )
-  hosp_stays_cat <- factor(hosp_stays_num, levels = 0:6, labels = hosp_labels)
+  
+  # Collapse to 4 buckets: 0; 1; 2–3; ≥4
+  hosp_num <- dplyr::case_when(
+    is.na(hosp_stays_num)        ~ NA_integer_,
+    hosp_stays_num == 0L         ~ 0L,
+    hosp_stays_num == 1L         ~ 1L,
+    hosp_stays_num %in% 2L:3L    ~ 2L,
+    hosp_stays_num >= 4L         ~ 3L
+  )
+  
+  hosp_stays_cat <- factor(  hosp_num, levels = 0:3, labels = hosp_labels)
   
   tibble::tibble(
     seqn = as.integer(df$seqn),
