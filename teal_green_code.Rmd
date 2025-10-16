@@ -3,10 +3,10 @@ title: "SPPH604: Polypharmacy & Mortality – Reproducible Analyses (MI pooled)"
 author: "Teal Green (Alexi, Alex, Ezra)"
 date: "`r format(Sys.Date())`"
 output:
-  html_document:
-    df_print: paged
   pdf_document:
     latex_engine: xelatex
+  html_document:
+    df_print: paged
   word_document: default
 ---
 
@@ -294,7 +294,7 @@ tbl_outcome_merged <- tbl_stack(
   ) %>%
   bold_labels()
 
-as_gt(tbl_outcome_merged)
+print(tbl_outcome_merged)
 
 
 # ========== BY EXPOSURE ==========
@@ -381,7 +381,7 @@ tbl_exposure_merged <- tbl_stack(
   ) %>%
   bold_labels()
 
-as_gt(tbl_exposure_merged)
+print(tbl_exposure_merged)
 ```
 
 # Kaplan–Meier curves by polypharmacy
@@ -585,7 +585,7 @@ tbl_combined_gt <- gtsummary::as_gt(tbl_combined) %>%
     )
 
 # Print the combined table
-tbl_combined_gt
+print(tbl_combined_gt)
 ```
 
 # Stratification descriptive statistics by therapeutic-class
@@ -593,7 +593,32 @@ tbl_combined_gt
 # ---- Descriptives by exposure within therapeutic-class user cohorts ----------
 # Uses imputation #1; unweighted N in headers; weighted continuous / unweighted categorical
 
-# classes to analyze (must exist in rx_all)
+rx_all <- analytic_raw %>%
+  select(
+    seqn,
+    rxdcount,
+    rx_respiratory,
+    rx_cns,
+    rx_cardiovascular,
+    rx_topical,
+    rx_hormone,
+    rx_psychotherapeutic,
+    rx_metabolic,
+    rx_coagulation,
+    rx_gastrointestinal,
+    rx_antiinfective,
+    rx_misc,
+    rx_genitourinary,
+    rx_immunologic,
+    rx_nutrition,
+    rx_antineoplastic,
+    rx_biological,
+    rx_alternative,
+    rx_radiologic,
+    rx_plasma_expander
+  )
+
+# classes to analyze
 rx_targets <- c("rx_antineoplastic", "rx_cns", "rx_cardiovascular", "rx_psychotherapeutic")
 rx_targets <- intersect(rx_targets, names(rx_all))
 
@@ -747,7 +772,7 @@ build_desc_subsample_exposure <- function(flag) {
     ) %>%
     bold_labels()
 
-  as_gt(tbl_merged)
+  print(tbl_merged)
 }
 
 # build all four tables
@@ -1100,7 +1125,7 @@ tbl_multi <- gtsummary::tbl_regression(
     gtsummary::bold_labels()
 sink()
 
-as_gt(tbl_multi)
+print(tbl_multi)
 ```
 
 # Sensitivity 3: Exclude external‑cause deaths (ucod_leading 4 or 10)
@@ -1149,6 +1174,6 @@ tbl_no_external <- gtsummary::tbl_regression(
     gtsummary::bold_labels()
 sink()
 
-as_gt(tbl_no_external)
+print(tbl_no_external)
 ```
 
