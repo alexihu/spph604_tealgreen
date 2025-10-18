@@ -141,14 +141,36 @@ We impute **only `indfmpir`** using **predictive mean matching (PMM)** with pred
 # Convert insured to factor for MI (Yes/No based on non-missing status)
 mi_vars <- elig_df %>%
   transmute(
-    seqn, sddsrvyr, ridageyr = age_years, riagendr, ridreth1, wtint2yr, sdmvpsu, sdmvstra,
+    seqn,
+    sddsrvyr,
+    ridageyr = age_years,
+    riagendr,
+    ridreth1,
+    wtint2yr,
+    sdmvpsu,
+    sdmvstra,
     wtint_pool,
-    time_y, event, ucod_leading,
+    time_y,
+    event,
+    ucod_leading,
     age_years,
-    sex, race_eth, ed_cat, 
-    insured = factor(ifelse(!is.na(insured), "Yes", "No"), levels = c("No", "Yes")),
+    sex,
+    race_eth,
+    ed_cat,
+    insured = factor(
+      case_when(
+        insured == "Yes" ~ "Yes", 
+        insured == "No"  ~ "No", 
+        TRUE ~ NA_character_),
+      levels = c("No", "Yes")
+    ),
     indfmpir,
-    rxdcount, poly_cat, comorbidity_n, cci_score, visits_cat, hosp_stays_cat
+    rxdcount,
+    poly_cat,
+    comorbidity_n,
+    cci_score,
+    visits_cat,
+    hosp_stays_cat
   )
 
 # Build empty 'mids' where only indfmpir is imputed
@@ -1016,3 +1038,122 @@ as_gt(tbl_no_external)
 ```
 
 **Interpretation:** By excluding external-cause deaths, we can assess whether the polypharmacy-mortality association is driven primarily by disease-related deaths rather than accidental or violence-related deaths.
+
+
+
+
+# Model diagnostics (MI pooled): Full model
+
+We perform diagnostics on the full Cox model fitted via `mice::with()` across 20 imputations, assessing proportional hazards assumption, multicollinearity (GVIF), and model fit.
+
+## 1. Proportional hazards assumption (Schoenfeld residuals, MI-pooled)
+
+For each imputed dataset, we test the PH assumption using scaled Schoenfeld residuals, then pool results.
+
+```{r ph-assumption}
+# Extract PH tests from each imputed fit in the mira object
+ph_tests_list <- lapply(fit_full$analyses, function(fit_obj) {
+  # fit_obj is a svycoxph; cox.zph works on coxph objects
+  ph_test <- survival::cox.zph(fit_obj)
+  data.frame(
+    term = rownames(ph_test$table),
+    chisq = ph_test$table[, "chisq"],
+    df = ph_test$table[, "df"],
+    p_value = ph_test$table[, "p"]
+  )
+})
+
+# Pool p-values across imputations (simple average)
+n_imps <- length(ph_tests_list)
+ph_pooled <- ph_tests_list[[1]][, c("term", "df")]
+ph_pooled$chisq_mean <- sapply(seq_len(nrow(ph_pooled)), function(i) {
+  mean(sapply(ph_tests_list, function(x) x$chisq[i]), na.rm = TRUE)
+})
+ph_pooled$p_value_mean <- sapply(seq_len(nrow(ph_pooled)), function(i) {
+  mean(sapply(ph_tests_list, function(x) x$p_value[i]), na.rm = TRUE)
+})
+ph_pooled$p_value_sd <- sapply(seq_len(nrow(ph_pooled)), function(i) {
+  sd(sapply(ph_tests_list, function(x) x$p_value[i]), na.rm = TRUE)
+})
+
+ph_pooled <- ph_pooled %>%
+  mutate(
+    term = as.character(term),
+    assumption_met = ifelse(p_value_mean < 0.05, "⚠ Violated", "✓ Holds"),
+    interpretation = ifelse(p_value_mean < 0.05, 
+                           "May violate PH; consider stratification or time-varying coef.", 
+                           "Proportional hazards assumption appears satisfied")
+  ) %>%
+  select(term, chisq_mean, df, p_value_mean, p_value_sd, assumption_met)
+
+knitr::kable(
+  ph_pooled,
+  col.names = c("Variable", "χ² (mean)", "df", "p (mean)", "p (SD across imputations)", "PH Assumption"),
+  digits = c(0, 3, 0, 4, 4, 0),
+  caption = "Proportional hazards assumption test (pooled across 20 imputations)",
+  format = "html"
+) %>% kableExtra::kable_styling()
+```
+
+**Interpretation:** Tests PH assumption for each covariate. A pooled p-value < 0.05 suggests the assumption may be violated. The SD shows variability across imputations—large SD suggests PH assessment varies by imputation.
+
+## 2. Multicollinearity: GVIF analysis (representative imputation #1)
+
+We assess multicollinearity using generalized variance inflation factors (GVIF) on the first imputation as a representative sample.
+
+```{r multicollinearity-gvif}
+# Extract first imputation's fit
+fit_imp1 <- fit_full$analyses[[1]]
+
+# Compute GVIF using car::vif
+suppressWarnings({
+  gvif_result <- if (requireNamespace("car", quietly = TRUE)) {
+    car::vif(fit_imp1)
+  } else {
+    NULL
+  }
+})
+
+if (!is.null(gvif_result)) {
+  if (is.matrix(gvif_result)) {
+    # Polytomous variables: GVIF with df adjustment
+    gvif_df <- as.data.frame(gvif_result) %>%
+      rownames_to_column("Variable") %>%
+      rename(GVIF = GVIF, DF = Df, `GVIF^(1/(2*DF))` = matches("GVIF.*2.*DF")) %>%
+      mutate(
+        Multicollinearity = case_when(
+          GVIF > 10 ~ "🚨 SEVERE",
+          GVIF > 5 ~ "⚠ HIGH",
+          GVIF > 2.5 ~ "~ MODERATE",
+          TRUE ~ "✓ LOW"
+        )
+      )
+  } else {
+    # Continuous variables only
+    gvif_df <- data.frame(
+      Variable = names(gvif_result),
+      GVIF = as.numeric(gvif_result)
+    ) %>%
+      mutate(
+        Multicollinearity = case_when(
+          GVIF > 10 ~ "🚨 SEVERE",
+          GVIF > 5 ~ "⚠ HIGH",
+          GVIF > 2.5 ~ "~ MODERATE",
+          TRUE ~ "✓ LOW"
+        )
+      )
+  }
+  
+  knitr::kable(
+    gvif_df,
+    digits = 3,
+    caption = "Generalized Variance Inflation Factors (GVIF) for full model (imputation #1)",
+    format = "html"
+  ) %>% kableExtra::kable_styling()
+} else {
+  cat("car package not available for GVIF computation.")
+}
+```
+
+**Interpretation:** GVIF > 5 indicates high multicollinearity. Note that categorical variables (age_cat, race_eth, ed_cat) are reported with degrees of freedom. `GVIF^(1/(2*DF))` is a normalized version comparable to univariate VIF; values > 2.5 warrant attention. Moderate correlations among socioeconomic variables (education, income, insurance) are expected.
+
