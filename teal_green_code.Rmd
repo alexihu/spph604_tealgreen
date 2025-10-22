@@ -46,6 +46,7 @@ library(mitools)
 library(naniar)
 library(ggplot2)
 library(scales)
+library(DataExplorer)
 
 options(survey.lonely.psu = "adjust")
 ```
@@ -103,9 +104,17 @@ glimpse(elig_df)
 We inspect **INDFMPIR** and **insured** after eligibility subsetting to assess patterns of missingness.
 
 ```{r missingness-review}
-# Summaries of missingness
-miss_vars <- c("indfmpir","insured")
-elig_df %>% miss_var_summary(include = all_of(miss_vars))
+miss_vars <- c(
+    "indfmpir","insured","age_years","sex","race_eth","ed_cat",
+    "comorbidity_n","cci_score","visits_cat","hosp_stays_cat"
+)
+
+# Variable-wise missingness summary (counts & %)
+elig_df %>%
+    miss_var_summary(include = dplyr::all_of(miss_vars))
+
+# Plot mkissingness
+plot_missing(elig_df[, miss_vars])
 
 # Cross-tab of missingness indicators vs key predictors (simple MAR diagnostics)
 elig_df <- elig_df %>%
@@ -114,19 +123,22 @@ elig_df <- elig_df %>%
     miss_insured  = factor(ifelse(is.na(insured),  "Missing","Observed"))
   )
 
-# Patterns with naniar
-vis_miss(elig_df[, c("indfmpir","insured","age_years","sex","race_eth","ed_cat")])
-
 # Simple logistic models for missingness (MCAR would imply no association)
-fit_miss_indf <- glm(I(is.na(indfmpir)) ~ age_years + sex + race_eth + ed_cat + insured,
+fit_miss_indf <- glm(I(is.na(indfmpir)) ~ 
+                       age_years + sex + race_eth + ed_cat + insured + comorbidity_n + cci_score +
+                       visits_cat + hosp_stays_cat,
                      data = elig_df, family = binomial())
-fit_miss_ins  <- glm(I(is.na(insured)) ~ age_years + sex + race_eth + ed_cat + indfmpir,
+fit_miss_ins  <- glm(I(is.na(insured)) ~ 
+                       age_years + sex + race_eth + ed_cat + indfmpir + comorbidity_n + cci_score +
+                       visits_cat + hosp_stays_cat,
                      data = elig_df, family = binomial())
 
 broom::tidy(fit_miss_indf, exponentiate = TRUE, conf.int = TRUE) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 2))) %>% 
   select(term, estimate, conf.low, conf.high, p.value)
 
 broom::tidy(fit_miss_ins, exponentiate = TRUE, conf.int = TRUE) %>%
+    dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 2))) %>% 
   select(term, estimate, conf.low, conf.high, p.value)
 ```
 
@@ -341,34 +353,125 @@ as_gt(tbl_exposure_merged)
 
 \newpage
 
-# Kaplan–Meier curves by polypharmacy
+# Kaplan–Meier curves by polypharmacy + log-rank test
 
-We present unadjusted Kaplan-Meier survival curves stratified by polypharmacy category to visualize crude survival patterns over follow-up time.
+We present a weighted Kaplan-Meier survival curves stratified by polypharmacy category to visualize crude survival patterns over follow-up time.
 
 ```{r km-curves, fig.width=8, fig.height=6, fig.cap="Kaplan-Meier survival curves by polypharmacy category"}
-km_unweighted <- survfit(Surv(time_y, event) ~ poly_cat, data = d1$variables)
-km_df <- broom::tidy(km_unweighted) %>% mutate(strata = gsub("poly_cat=", "", strata))
+# ---- Survey-weighted Kaplan–Meier by polypharmacy (full time; no SE/CI) -----
 
-ggplot(km_df, aes(x = time, y = estimate, color = strata)) +
-    geom_step(linewidth = 0.8) +
-    geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = strata),
-                alpha = 0.15, color = NA) +
-    geom_hline(yintercept = c(0.25, 0.5, 0.75), 
-               linetype = "dashed", color = "gray80", linewidth = 0.3) +
-    labs(title = "Kaplan–Meier Survival Curves by Polypharmacy Category",
-        x = "Time since baseline interview (years)", y = "Survival probability",
-        color = "Polypharmacy", fill = "Polypharmacy") +
-    scale_y_continuous(limits = c(0, 1), labels = scales::percent_format(accuracy = 1),
-        breaks = seq(0, 1, 0.25)) +
-    scale_x_continuous(breaks = seq(0, max(km_df$time), by = 2)) +
-    scale_color_viridis_d(option = "D", end = 0.9) +
-    scale_fill_viridis_d(option = "D", end = 0.9) +
-    theme_minimal(base_size = 12) +
-    theme(legend.position = "bottom", legend.title = element_text(face = "bold"),
-        plot.title = element_text(face = "bold", size = 14),
-        panel.grid.minor = element_blank(),
-        panel.grid.major = element_line(color = "gray90", linewidth = 0.3)) +
-    guides(color = guide_legend(nrow = 1), fill = guide_legend(nrow = 1))
+# Complete imputation #1 for descriptive plots 
+di1 <- mice::complete(imp, 1) %>%
+  dplyr::mutate(
+    poly_cat = factor(poly_cat, levels = c("0", "1–4", "5–9", "≥10"))
+  )
+
+# Survey design (pooled interview weights)
+dd1 <- svydesign(
+  ids     = ~ sdmvpsu,
+  strata  = ~ sdmvstra,
+  weights = ~ wtint_pool,
+  nest    = TRUE,
+  data    = di1
+)
+
+# One stratified svykm() call over full follow-up (no SE, no CI)
+km_fit <- svykm(
+  survival::Surv(time_y, event) ~ poly_cat,
+  design = dd1,
+  se = FALSE, ci = FALSE
+)
+
+# Tidy the list of curves for ggplot
+km_df <- purrr::imap_dfr(km_fit, function(fit, grp) {
+  tibble::tibble(
+    time     = fit$time,
+    surv     = fit$surv,
+    poly_cat = grp
+  )
+})
+
+# Plot (weighted KM curves)
+ggplot2::ggplot(km_df, ggplot2::aes(x = time, y = surv, color = poly_cat)) +
+  ggplot2::geom_step(linewidth = 0.9) +
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  ggplot2::labs(
+    title = "Survey-weighted Kaplan–Meier survival by medication category",
+    x = "Years since interview",
+    y = "Survival probability",
+    color = "Polypharmacy"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "right",
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+# -------------------------- Design-based log-rank tests ------------------------
+
+if ("svylogrank" %in% getNamespaceExports("survey")) {
+  lr_test <- svylogrank(survival::Surv(time_y, event) ~ poly_cat, design = dd1)
+  omni_tbl <- tibble::tibble(
+    test      = "Design-based log-rank (svylogrank)",
+    statistic = unname(lr_test$statistic),
+    df        = lr_test$parameter,
+    p_value   = lr_test$p.value
+  )
+} else {
+  # Omnibus design-based test via Cox + Rao–Scott (regTermTest)
+  fit_lr  <- svycoxph(survival::Surv(time_y, event) ~ poly_cat, design = dd1)
+  omnibus <- regTermTest(fit_lr, ~ poly_cat)
+  omni_tbl <- tibble::tibble(
+    test      = "Design-based log-rank (Cox/regTermTest)",
+    statistic = unname(omnibus$Ftest),
+    df_num    = omnibus$df[1],
+    df_den    = omnibus$df[2],
+    p_value   = omnibus$p
+  )
+}
+
+knitr::kable(
+  omni_tbl,
+  digits = 4,
+  caption = "Omnibus design-based log-rank test across medication-use categories"
+)
+
+# Pairwise design-based comparisons (2-group Cox per contrast with Holm adjust)
+lvls <- levels(di1$poly_cat)
+pairs <- utils::combn(lvls, 2, simplify = FALSE)
+
+sink(tempfile())
+pair_tbl <- purrr::map_dfr(pairs, function(pr) {
+  dsub <- subset(dd1, poly_cat %in% pr)
+  # Relevel to ensure the first element of the pair is the reference
+  dsub <- update(dsub, poly2 = factor(poly_cat, levels = pr))
+  f2   <- svycoxph(survival::Surv(time_y, event) ~ poly2, design = dsub)
+
+  cs <- summary(f2)$coefficients
+  p  <- if (!is.null(cs) && nrow(cs) >= 1) {
+    if ("Pr(>|z|)" %in% colnames(cs)) cs[1, "Pr(>|z|)"]
+    else if ("p" %in% colnames(cs))    cs[1, "p"]
+    else NA_real_
+  } else {
+    NA_real_
+  }
+
+  tibble::tibble(
+    contrast = paste0(pr[1], " vs ", pr[2]),
+    p_value  = as.numeric(p)
+  )
+}) %>%
+  dplyr::mutate(p_value_adj = p.adjust(p_value, method = "holm"))
+sink()
+
+knitr::kable(
+  pair_tbl,
+  digits = 4,
+  caption = "Pairwise design-based log-rank (survey-weighted Cox) comparisons with Holm adjustment"
+)
 ```
 
 \newpage
@@ -772,7 +875,7 @@ fit_full_subsample <- function(flag) {
 
     # survey design
     invisible(utils::capture.output(
-      dd <- survey::svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+      dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
                               nest = TRUE, data = di)
     ))
 
@@ -839,31 +942,36 @@ tbls_sub[[4]]
 
 \newpage
 
-# Sensitivity 1: Continuous exposure (spline), 0‑meds reference (MI pooled)
+# Sensitivity 1: Continuous exposure (spline)
 
 We fit `svycoxph` with a natural cubic spline for `rxdcount` (knots at 5 & 10 medications), pool **coefficients & covariance** across imputations, then use the **delta method** to plot HRs and 95% CIs **relative to 0 medications** for a **survey‑weighted reference profile** (modes/medians).
 
 ```{r spline-model, fig.width=8, fig.height=6, fig.cap="Adjusted hazard ratio vs medication count (MI pooled spline model)"}
-# Fit spline model on each imputed dataset
+# ---- Spline sensitivity (MI-pooled) + non-linearity test + collinearity check ----
+
+# 1) Fit the spline model on each imputed survey design (no poly_cat update needed)
 fit_list <- lapply(design_list, function(dd) {
-  dd <- update(dd, poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
-               insured = factor(insured, levels = c("No", "Yes")))
-  svycoxph(Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5,10)) +
-             age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
-             comorbidity_n + cci_score + visits_cat + hosp_stays_cat, design = dd)
+  # keep only the insured relevel (used in the model)
+  dd <- update(dd, insured = factor(insured, levels = c("No", "Yes")))
+  svycoxph(
+    Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5, 10)) +
+      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
+      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+    design = dd
+  )
 })
 
+# Pool coefficients & vcovs across imputations
 coefs <- lapply(fit_list, coef)
 vcovs <- lapply(fit_list, vcov)
-
-# Rubin pooling via mitools
-mi_pool <- MIcombine(coefs, vcovs)
-beta <- mi_pool$coefficients
-V <- mi_pool$variance
+mi_pool <- mitools::MIcombine(coefs, vcovs)
+beta    <- mi_pool$coefficients
+V       <- mi_pool$variance
 coef_nm <- names(beta)
 
-# Build reference profile from imputed dataset #1
+# 2) Build a reference profile from imputation #1 (survey-weighted medians/modes)
 d1 <- design_list[[1]]
+
 svy_median <- function(des, var) {
   q <- svyquantile(as.formula(paste0("~", var)), des, quantiles = 0.5, na.rm = TRUE, ci = FALSE)
   as.numeric(coef(q))
@@ -874,75 +982,152 @@ svy_mode <- function(des, var) {
 }
 
 dat1 <- d1$variables
-ref_age_cat_val <- svy_mode(d1, "age_cat")
-ref_sex_val <- svy_mode(d1, "sex")
-ref_race_val <- svy_mode(d1, "race_eth")
-ref_ed_val <- svy_mode(d1, "ed_cat")
-ref_pir_cat_val <- svy_mode(d1, "indfmpir_cat")
-ref_insured_val <- svy_mode(d1, "insured")
-ref_visits_val <- svy_mode(d1, "visits_cat")
-ref_hosp_stays_val <- svy_mode(d1, "hosp_stays_cat")
-ref_comorb_n <- svy_median(d1, "comorbidity_n")
-ref_cci <- svy_median(d1, "cci_score")
+ref_age_cat_val   <- svy_mode(d1, "age_cat")
+ref_sex_val       <- svy_mode(d1, "sex")
+ref_race_val      <- svy_mode(d1, "race_eth")
+ref_ed_val        <- svy_mode(d1, "ed_cat")
+ref_pir_cat_val   <- svy_mode(d1, "indfmpir_cat")
+ref_insured_val   <- svy_mode(d1, "insured")
+ref_visits_val    <- svy_mode(d1, "visits_cat")
+ref_hosp_stays_val<- svy_mode(d1, "hosp_stays_cat")
+ref_comorb_n      <- svy_median(d1, "comorbidity_n")
+ref_cci           <- svy_median(d1, "cci_score")
 
-# Prediction grid - create base row with proper factor levels
-pred_grid_base <- tibble(
-    rxdcount = 0,
-    age_cat = factor(ref_age_cat_val, levels = levels(dat1$age_cat)),
-    sex = factor(ref_sex_val, levels = levels(dat1$sex)),
-    race_eth = factor(ref_race_val, levels = levels(dat1$race_eth)),
-    ed_cat = factor(ref_ed_val, levels = levels(dat1$ed_cat)),
-    indfmpir_cat = factor(ref_pir_cat_val, levels = levels(dat1$indfmpir_cat)),
-    insured = factor(ref_insured_val, levels = levels(dat1$insured)),
-    comorbidity_n = ref_comorb_n,
-    cci_score = ref_cci,
-    visits_cat = factor(ref_visits_val, levels = levels(dat1$visits_cat)),
-    hosp_stays_cat = factor(ref_hosp_stays_val, levels = levels(dat1$hosp_stays_cat))
+# 3) Prediction grid: 0..25 medications at the reference covariate profile
+pred_grid_base <- tibble::tibble(
+  rxdcount      = 0,
+  age_cat       = factor(ref_age_cat_val,   levels = levels(dat1$age_cat)),
+  sex           = factor(ref_sex_val,       levels = levels(dat1$sex)),
+  race_eth      = factor(ref_race_val,      levels = levels(dat1$race_eth)),
+  ed_cat        = factor(ref_ed_val,        levels = levels(dat1$ed_cat)),
+  indfmpir_cat  = factor(ref_pir_cat_val,   levels = levels(dat1$indfmpir_cat)),
+  insured       = factor(ref_insured_val,   levels = levels(dat1$insured)),
+  comorbidity_n = ref_comorb_n,
+  cci_score     = ref_cci,
+  visits_cat    = factor(ref_visits_val,    levels = levels(dat1$visits_cat)),
+  hosp_stays_cat= factor(ref_hosp_stays_val,levels = levels(dat1$hosp_stays_cat))
 )
 
-# Expand to all medication counts while preserving factor levels
-pred_grid <- pred_grid_base %>%
-    slice(rep(1, 26)) %>%
-    mutate(rxdcount = 0:25)
+pred_grid <- pred_grid_base |>
+  dplyr::slice(rep(1, 26)) |>
+  dplyr::mutate(rxdcount = 0:25)
 
-# Create model matrix
+# 4) Model matrix from the pooled spline model, ensure column alignment
 TT_full <- terms(fit_list[[1]])
-TT_noy <- delete.response(TT_full)
+TT_noy  <- delete.response(TT_full)
 mf_grid <- model.frame(TT_noy, data = pred_grid,
                        xlev = fit_list[[1]]$xlevels, na.action = na.pass)
 X <- model.matrix(TT_noy, mf_grid)
 X <- X[, coef_nm, drop = FALSE]
 
-# Calculate HRs relative to 0 medications
-X_ref <- X[1, , drop = FALSE]
-Delta <- X - matrix(X_ref, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)
-lp <- as.vector(Delta %*% beta)
-se_lp <- sqrt(pmax(0, rowSums((Delta %*% V) * Delta)))
+# HRs relative to 0 medications on the reference profile
+X_ref  <- X[1, , drop = FALSE]
+Delta  <- X - matrix(X_ref, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)
+lp     <- as.vector(Delta %*% beta)
+se_lp  <- sqrt(pmax(0, rowSums((Delta %*% V) * Delta)))
 
-pred_df <- pred_grid %>%
-  mutate(
-    HR = exp(lp),
+pred_df <- pred_grid |>
+  dplyr::mutate(
+    HR  = exp(lp),
     LCL = exp(lp - 1.96 * se_lp),
     UCL = exp(lp + 1.96 * se_lp)
   )
 
-# Create the plot
+# 5) Plot: MI-pooled adjusted HR vs medication count (spline with knots 5 & 10)
 ggplot(pred_df, aes(x = rxdcount, y = HR)) +
   geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.2) +
   geom_line(linewidth = 1) +
-  geom_hline(yintercept = 1, linetype = 2, color = "gray50") +
+  geom_hline(yintercept = 1, linetype = 2) +
   labs(
-    title = "Adjusted HR vs medication count (MI pooled)",
-    subtitle = "Natural spline (knots 5 & 10). Reference = 0 medications.",
-    x = "Medication count", 
+    title    = "Adjusted hazard ratio vs medication count (MI pooled)",
+    subtitle = "Natural cubic spline with knots at 5 and 10",
+    x = "Medication count",
     y = "Hazard Ratio (95% CI)"
   ) +
   scale_y_continuous(trans = "log10", breaks = c(0.5, 1, 2, 3, 5, 10)) +
   theme_minimal(base_size = 12) +
-  theme(
-    plot.title = element_text(face = "bold"),
-    panel.grid.minor = element_blank()
+  theme(plot.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank())
+
+# ------------------------------ Diagnostics -----------------------------------
+
+# (A) Wald test of non-linearity: test curvature terms = 0 after pooling
+# Build curvature-only basis (orthogonal to linear rxdcount), df=2 with knots at 5 & 10
+make_curvature_basis <- function(x, knots = c(5, 10), boundary = NULL) {
+  x <- as.numeric(x)
+  if (is.null(boundary)) boundary <- range(x, na.rm = TRUE)
+  B <- splines::ns(x, knots = knots, Boundary.knots = boundary, intercept = FALSE)  # 3 cols
+  Xlin <- matrix(x, ncol = 1)
+  proj <- Xlin %*% solve(crossprod(Xlin), crossprod(Xlin, as.matrix(B)))
+  R <- as.matrix(B) - proj
+  colnames(R) <- paste0("spl2_", seq_len(ncol(R)))  # typically 2 curvature cols when df=3
+  as.data.frame(R)
+}
+
+# Fit linear + curvature model on each imputed dataset, then pool and test
+fits_curv <- lapply(design_list, function(dd) {
+  dat <- dd$variables
+  curv <- make_curvature_basis(dat$rxdcount, knots = c(5, 10))
+  dat2 <- cbind(dat, curv)
+  dd2 <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                   nest = TRUE, data = dat2)
+  svycoxph(
+    Surv(time_y, event) ~ rxdcount + spl2_1 + spl2_2 +
+      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
+      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+    design = dd2
   )
+})
+
+coefs_c <- lapply(fits_curv, coef)
+vcovs_c <- lapply(fits_curv, vcov)
+mi_c    <- mitools::MIcombine(coefs_c, vcovs_c)
+
+# Wald test H0: spl2_1 = spl2_2 = 0 (no curvature; i.e., linear effect is adequate)
+beta_c <- coef(mi_c); V_c <- vcov(mi_c)
+keep   <- names(beta_c) %in% c("spl2_1", "spl2_2")
+C      <- diag(sum(keep))
+colnames(C) <- names(beta_c)[keep]; rownames(C) <- colnames(C)
+# align C to the full parameter vector
+C_full <- matrix(0, nrow = nrow(C), ncol = length(beta_c),
+                 dimnames = list(rownames(C), names(beta_c)))
+C_full[, keep] <- C
+
+W   <- as.numeric(t(C_full %*% beta_c) %*% solve(C_full %*% V_c %*% t(C_full)) %*% (C_full %*% beta_c))
+dfW <- nrow(C_full)
+pW  <- pchisq(W, df = dfW, lower.tail = FALSE)
+
+cat("\nWald test of non-linearity (curvature terms = 0): ",
+    "Chi-square = ", round(W, 2), " on ", dfW, " df; p = ", signif(pW, 3), "\n", sep = "")
+
+# (B) Multicollinearity: weighted (G)VIFs for the same predictor set (imputation #1)
+  di1 <- design_list[[1]]$variables
+  curv1 <- make_curvature_basis(di1$rxdcount, knots = c(5, 10))
+  di1c  <- cbind(di1, curv1)
+
+  # Dummy weighted linear model (response is irrelevant for VIF)
+  vif_fit <- lm(
+    rnorm(nrow(di1c)) ~ rxdcount + spl2_1 + spl2_2 +
+      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
+      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+    data = di1c,
+    weights = wtint_pool
+  )
+
+  gv <- car::vif(vif_fit)  # GVIF for multi-df factors; VIF for 1-df terms
+
+  gv_tbl <- if (is.matrix(gv)) {
+    tibble::tibble(term = rownames(gv),
+                   GVIF = gv[, "GVIF"],
+                   Df   = gv[, "Df"],
+                   adj_GVIF = gv[, "GVIF"]^(1/(2*gv[, "Df"])))
+  } else {
+    tibble::tibble(term = names(gv), VIF = as.numeric(gv))
+  }
+
+  cat("\nWeighted (G)VIFs for spline model predictors (imputation #1):\n")
+  print(gv_tbl)
+  cat("Rule of thumb: VIF > 5 (or adjusted GVIF > ~2–3) may indicate concerning collinearity.\n")
 ```
 
 **Interpretation:** This spline model allows us to examine the dose-response relationship between medication count and mortality risk continuously. The natural cubic spline with knots at 5 and 10 medications provides flexibility to capture non-linear patterns while maintaining smoothness.
@@ -1102,57 +1287,69 @@ knitr::kable(
 We assess multicollinearity using generalized variance inflation factors (GVIF) on the first imputation as a representative sample.
 
 ```{r multicollinearity-gvif}
-# Extract first imputation's fit
-fit_imp1 <- fit_full$analyses[[1]]
+# ---- Multicollinearity (GVIF) on imputation #1: auxiliary weighted LM ----
 
-# Compute GVIF using car::vif
-suppressWarnings({
-  gvif_result <- if (requireNamespace("car", quietly = TRUE)) {
-    car::vif(fit_imp1)
-  } else {
-    NULL
-  }
-})
+# Build the same analysis frame used in the full model (imp #1)
+d1 <- design_list[[1]]$variables %>%
+  mutate(
+    # ensure identical factor levels & dropped empties as in the Cox model
+    poly_cat       = factor(poly_cat, levels = c("1–4","0","5–9","≥10")) %>% forcats::fct_drop(),
+    age_cat        = factor(age_cat)        %>% forcats::fct_drop(),
+    sex            = factor(sex)            %>% forcats::fct_drop(),
+    race_eth       = factor(race_eth)       %>% forcats::fct_drop(),
+    ed_cat         = factor(ed_cat)         %>% forcats::fct_drop(),
+    indfmpir_cat   = factor(indfmpir_cat)   %>% forcats::fct_drop(),
+    insured        = factor(insured, levels = c("No","Yes")) %>% forcats::fct_drop(),
+    visits_cat     = factor(visits_cat)     %>% forcats::fct_drop(),
+    hosp_stays_cat = factor(hosp_stays_cat) %>% forcats::fct_drop()
+  )
 
-if (!is.null(gvif_result)) {
-  if (is.matrix(gvif_result)) {
-    # Polytomous variables: GVIF with df adjustment
-    gvif_df <- as.data.frame(gvif_result) %>%
-      rownames_to_column("Variable") %>%
-      rename(GVIF = GVIF, DF = Df, `GVIF^(1/(2*DF))` = matches("GVIF.*2.*DF")) %>%
-      mutate(
-        Multicollinearity = case_when(
-          GVIF > 10 ~ "🚨 SEVERE",
-          GVIF > 5 ~ "⚠ HIGH",
-          GVIF > 2.5 ~ "~ MODERATE",
-          TRUE ~ "✓ LOW"
-        )
-      )
+# Dummy outcome: VIF uses only the X matrix; outcome choice doesn't matter
+set.seed(604)
+y_dummy <- rnorm(nrow(d1))
+
+# Auxiliary weighted linear model with the EXACT SAME RHS as the full Cox model
+aux_lm <- lm(
+  y_dummy ~ poly_cat + age_cat + sex + race_eth + ed_cat + indfmpir_cat +
+    insured + comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+  data    = d1,
+  weights = wtint_pool
+)
+
+# GVIF/GVIF^(1/(2*Df))
+gv <- car::vif(aux_lm)
+
+gvif_df <-
+  if (is.matrix(gv)) {
+    # multi-df terms present
+    as.data.frame(gv) %>%
+      tibble::rownames_to_column("Variable") %>%
+      dplyr::rename(GVIF = GVIF, Df = Df) %>%
+      dplyr::mutate(`Adj.GVIF` = GVIF^(1/(2*Df)))
   } else {
-    # Continuous variables only
-    gvif_df <- data.frame(
-      Variable = names(gvif_result),
-      GVIF = as.numeric(gvif_result)
-    ) %>%
-      mutate(
-        Multicollinearity = case_when(
-          GVIF > 10 ~ "🚨 SEVERE",
-          GVIF > 5 ~ "⚠ HIGH",
-          GVIF > 2.5 ~ "~ MODERATE",
-          TRUE ~ "✓ LOW"
-        )
-      )
-  }
-  
-  knitr::kable(
-    gvif_df,
-    digits = 3,
-    caption = "Generalized Variance Inflation Factors (GVIF) for full model (imputation #1)",
-    format = "html"
-  ) %>% kableExtra::kable_styling()
-} else {
-  cat("car package not available for GVIF computation.")
-}
+    # all 1-df terms
+    tibble::tibble(
+      Variable = names(gv),
+      GVIF     = as.numeric(gv),
+      Df       = 1L,
+      `Adj.GVIF` = sqrt(GVIF)
+    )
+  } %>%
+  dplyr::mutate(
+    Severity = dplyr::case_when(
+      `Adj.GVIF` > 5    ~ "🚨 severe",
+      `Adj.GVIF` > 2.5  ~ "⚠ high",
+      `Adj.GVIF` > 2.0  ~ "~ moderate",
+      TRUE              ~ "✓ low"
+    )
+  )
+
+knitr::kable(
+  gvif_df,
+  digits  = 3,
+  caption = "Adjusted GVIFs (imputation #1); auxiliary weighted linear model with full-model predictors"
+) %>%
+  kableExtra::kable_styling()
 ```
 
 **Interpretation:** GVIF > 5 indicates high multicollinearity. Note that categorical variables (age_cat, race_eth, ed_cat) are reported with degrees of freedom. `GVIF^(1/(2*DF))` is a normalized version comparable to univariate VIF; values > 2.5 warrant attention. Moderate correlations among socioeconomic variables (education, income, insurance) are expected.
