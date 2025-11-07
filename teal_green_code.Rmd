@@ -1,5 +1,5 @@
 ---
-title: "SPPH604: Polypharmacy & Mortality – Reproducible Analyses (MI pooled)"
+title: "SPPH604: Polypharmacy & Mortality – Reproducible Analyses"
 author: "Teal Green (Alexi, Alex, Ezra)"
 date: "`r format(Sys.Date())`"
 output:
@@ -12,29 +12,73 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.pos = 'H')
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.pos = 'H'
+)
 set.seed(604)
+
+# Suppress package loading messages
+suppressMessages(suppressWarnings({
+  library(tidyverse)
+  library(survey)
+  library(survival)
+  library(gtsummary)
+  library(gt)
+  library(broom)
+  library(mice)
+  library(mitools)
+  library(naniar)
+  library(ggplot2)
+  library(scales)
+  library(DataExplorer)
+  library(splines)
+  library(car)
+  library(forcats)
+  library(stringr)
+  library(kableExtra)
+}))
+
+options(survey.lonely.psu = "adjust")
 ```
 
 # Overview
 
-This document loads the cleaned analytic dataset produced by `data_clean.R` and performs our analysis. We follow NHANES best practice: build the **survey design first (on the full dataset)**, apply **eligibility via survey subsetting**, and then conduct analyses. We address missingness in key variables with **multiple imputation (MI)**, and fit and pool **all models across imputations** unless noted.
+This document analyzes the association between levels of prescription medication use and all-cause mortality among U.S. adults aged 45 years and older in NHANES 2003–2018. We follow NHANES analytic guidance (design first → subset → analyze), handle missingness in key covariates with multiple imputation, and fit/pool survey-weighted Cox models. We also include spline sensitivity analyses, interaction models with therapeutic classes, and several robustness checks (censoring, multimorbidity restrictions).
 
-**Research question.** Among U.S. adults aged 45 years or above in NHANES 2003–2018, are levels of medication use associated with all‑cause mortality?
+**Research question.** Among U.S. adults aged 45+ in NHANES 2003–2018, are different levels of medication use (0, 1–4, 5–9, ≥10) associated with all-cause mortality?
 
-**PICOT elements**  
-**Population (P):** U.S. adults aged 45+ in the 2003–2018 NHANES cycles.  
-**Intervention/Exposure (I):** Polypharmacy level by number of medications at interview: No polypharmacy (0 medications), polypharmacy (5–9), hyperpolypharmacy (≥10).  
-**Comparator (C):** Low medication use (1–4).  
-**Outcome (O):** Time from interview to **all‑cause mortality** (or censoring) using NHANES‑linked mortality files.  
-**Timeframe (T):** Up to ~17 years of follow‑up (through 2019 linkage in public files).  
-**Confounders (a priori):** Age (RIDAGEYR), sex (RIAGENDR), race/ethnicity (RIDRETH1), education (DMDEDUC2), **income‑to‑poverty ratio (INDFMPIR; imputed via PMM)**, health insurance (HIQ011), comorbidity burden (count and Charlson‑like score), and healthcare utilization (doctor visits; overnight hospital stays). We use survey strata, PSU, and interview weights throughout.
+**PICOT**
 
-> **Notes:** Our primary categorical exposure uses **1–4 medications as the reference** in regression models, aligning with clinical interpretation of "low polypharmacy" as the baseline. For the spline sensitivity, we display HRs **relative to 0 medications** to visualize the entire dose‑response curve from zero upward. We have expanded covariate adjustment to include insurance status and utilization measures.
+**Population:** U.S. adults aged ≥45 in NHANES 2003–2018
+
+**Intervention/exposure:** polypharmacy level (by interview-reported medication count)
+
+**Comparator:** 1–4 medications
+
+**Outcome:** time to all-cause mortality (linked mortality files through 2019)
+
+**Timeframe:** up to \~17 years follow-up
+
+**Covariates (a priori):** age, sex, race/ethnicity, education, income-to-poverty ratio, insurance, comorbidity burden (count + Charlson-like), health care utilization (visits, hospital stays), survey design.
+
+We deliberately:
+
+1.  **Do descriptive tables before imputation** and treat missing income and missing insurance as categories so they appear in the tables.
+
+2.  **Assess missingness patterns** through visualization and logistic regression models to evaluate the assumption of missing at random (MAR).
+
+3.  Then **impute both income-to-poverty ratio and insurance** using all analysis variables + survey design vars + a Nelson–Aalen cumulative hazard (so the outcome informs the imputation), following White & Royston (2009).
+
+4.  Then **fit the main Cox models** across imputations and pool with Rubin's rules.
+
+5.  **Check model diagnostics** including multicollinearity through variance inflation factors.
 
 ## Packages
 
-```{r packages}
+```{r packages, eval=FALSE}
 library(tidyverse)
 library(survey)
 library(survival)
@@ -47,6 +91,11 @@ library(naniar)
 library(ggplot2)
 library(scales)
 library(DataExplorer)
+library(splines)
+library(car)
+library(forcats)
+library(stringr)
+library(kableExtra)
 
 options(survey.lonely.psu = "adjust")
 ```
@@ -56,450 +105,537 @@ options(survey.lonely.psu = "adjust")
 We begin by loading our cleaned dataset and constructing the survey design object that accounts for NHANES' complex sampling structure.
 
 ```{r load-data}
-# Read the raw analytic dataset produced by data_clean.R
+# 1) Load dataset created in data_clean.R (provided separately)
 analytic_raw <- readRDS("data/analytic_raw.rds")
 
-# Pool interview weights across 8 cycles (2003–2018)
-analytic_raw <- analytic_raw %>% mutate(wtint_pool = wtint2yr / 8)
+# 2) Create pooled interview weight over 8 cycles
+analytic_raw <- analytic_raw %>%
+  mutate(wtint_pool = wtint2yr / 8)
 
-# Build survey design on the full dataset
-dsgn_all <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra,
-                      weights = ~wtint_pool, nest = TRUE,
-                      data = analytic_raw)
-
-# Eligibility: age >= 45, non-missing survival outcome/time
-dsgn_elig <- subset(dsgn_all, !is.na(ridageyr) & ridageyr >= 45 & 
-                      !is.na(time_y) & event %in% c(0,1))
-
-# Derive model-ready factors inside the survey design
-dsgn_elig <- update(
-  dsgn_elig,
-  age_years   = ridageyr,
-  age_cat     = factor(case_when(
-                    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-                    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-                    ridageyr >= 80                 ~ "80 or above"),
-                    levels = c("45-64","65-79","80 or above")),
-  sex         = sex,
-  race_eth    = race_eth,    
-  ed_cat      = ed_cat,       
-  insured     = insured,       
-  rxdcount    = rxdcount,
-  poly_cat    = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),  
-  comorbidity_n = as.numeric(comorbidity_n),
-  cci_score     = as.numeric(cci_score),
-  visits_cat    = visits_cat,
-  hosp_stays_cat= hosp_stays_cat,
-  time_y        = time_y,
-  event         = event,
-  ucod_leading  = ucod_leading
+# 3) Set up survey design on the full dataset
+dsgn_all <- svydesign(
+  ids     = ~ sdmvpsu,
+  strata  = ~ sdmvstra,
+  weights = ~ wtint_pool,
+  nest    = TRUE,
+  data    = analytic_raw
 )
 
+# 4) Eligibility: age ≥ 45, non-missing survival time/event
+dsgn_elig <- subset(
+  dsgn_all,
+  !is.na(ridageyr) & ridageyr >= 45 &
+    !is.na(time_y) &
+    event %in% c(0, 1)
+)
+
+# 5) Add model-ready variables to the survey design
+dsgn_elig <- update(
+  dsgn_elig,
+  age_years = ridageyr,
+  age_cat   = factor(case_when(
+    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+    ridageyr >= 80                 ~ "80 or above"
+  ), levels = c("45-64","65-79","80 or above")),
+  poly_cat  = factor(poly_cat, levels = c("1–4","0","5–9","≥10"))
+)
+
+# 6) Extract an ordinary data.frame for some steps
 elig_df <- dsgn_elig$variables
 glimpse(elig_df)
 ```
 
-# Missingness review (post‑eligibility)
+# **Descriptive statistics (pre-imputation, missing shown as category)**
 
-We inspect **INDFMPIR** and **insured** after eligibility subsetting to assess patterns of missingness.
+We first describe the sample as observed, without imputation, so that missing income and missing insurance appear explicitly. This approach allows us to transparently report the extent of missingness in our key socioeconomic variables before applying multiple imputation techniques.
 
-```{r missingness-review}
-miss_vars <- c(
-    "indfmpir","insured","age_years","sex","race_eth","ed_cat",
-    "comorbidity_n","cci_score","visits_cat","hosp_stays_cat"
-)
-
-# Variable-wise missingness summary (counts & %)
-elig_df %>%
-    miss_var_summary(include = dplyr::all_of(miss_vars))
-
-# Plot mkissingness
-plot_missing(elig_df[, miss_vars])
-
-# Cross-tab of missingness indicators vs key predictors (simple MAR diagnostics)
-elig_df <- elig_df %>%
+```{r descriptives-pre-mi}
+# Recode missing income and missing insurance as their own categories
+desc_df <- elig_df %>%
   mutate(
-    miss_indfmpir = factor(ifelse(is.na(indfmpir), "Missing","Observed")),
-    miss_insured  = factor(ifelse(is.na(insured),  "Missing","Observed"))
-  )
-
-# Simple logistic models for missingness (MCAR would imply no association)
-fit_miss_indf <- glm(I(is.na(indfmpir)) ~ 
-                       age_years + sex + race_eth + ed_cat + insured + comorbidity_n + cci_score +
-                       visits_cat + hosp_stays_cat,
-                     data = elig_df, family = binomial())
-fit_miss_ins  <- glm(I(is.na(insured)) ~ 
-                       age_years + sex + race_eth + ed_cat + indfmpir + comorbidity_n + cci_score +
-                       visits_cat + hosp_stays_cat,
-                     data = elig_df, family = binomial())
-
-broom::tidy(fit_miss_indf, exponentiate = TRUE, conf.int = TRUE) %>%
-  dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 2))) %>% 
-  select(term, estimate, conf.low, conf.high, p.value)
-
-broom::tidy(fit_miss_ins, exponentiate = TRUE, conf.int = TRUE) %>%
-    dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 2))) %>% 
-  select(term, estimate, conf.low, conf.high, p.value)
-```
-
-**Interpretation:** Logistic models of missingness reject MCAR for both INDFMPIR and INSURED. INDFMPIR missingness is strongly patterned by age, race/ethnicity, education, and insurance responses. Insurance missingness also varies with age, race/ethnicity, education, and income. We proceed with MI under the MAR assumption using observed predictors for INDFMPIR. We do not impute insurance and acknowledge that the small residual NA portion may not be ignorable MCAR.
-
-# Multiple imputation (MI) for INDFMPIR (PMM)
-
-We impute **only `indfmpir`** using **predictive mean matching (PMM)** with predictors `ed_cat + age_years + sex + race_eth + insured`. We use **m = 20** imputations and **maxit = 10** iterations.
-
-```{r multiple-imputation}
-# Prepare mids data.frame with needed fields
-# Convert insured to factor for MI (Yes/No based on non-missing status)
-mi_vars <- elig_df %>%
-  transmute(
-    seqn,
-    sddsrvyr,
-    ridageyr = age_years,
-    riagendr,
-    ridreth1,
-    wtint2yr,
-    sdmvpsu,
-    sdmvstra,
-    wtint_pool,
-    time_y,
-    event,
-    ucod_leading,
-    age_years,
-    sex,
-    race_eth,
-    ed_cat,
-    insured = factor(
-      case_when(
-        insured == "Yes" ~ "Yes", 
-        insured == "No"  ~ "No", 
-        TRUE ~ NA_character_),
-      levels = c("No", "Yes")
+    indfmpir_cat_obs = case_when(
+      is.na(indfmpir)              ~ "Missing",
+      indfmpir < 1                 ~ "<1.00 (below poverty)",
+      indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
+      indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
+      indfmpir >= 4                ~ "≥4.00"
     ),
-    indfmpir,
-    rxdcount,
-    poly_cat,
-    comorbidity_n,
-    cci_score,
-    visits_cat,
-    hosp_stays_cat
+    indfmpir_cat_obs = factor(
+      indfmpir_cat_obs,
+      levels = c("<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00", "Missing")
+    ),
+    insured_obs = case_when(
+      is.na(insured)   ~ "Missing/Unknown",
+      insured == "Yes" ~ "Yes",
+      insured == "No"  ~ "No",
+      TRUE             ~ "Missing/Unknown"
+    ),
+    insured_obs = factor(insured_obs, levels = c("No","Yes","Missing/Unknown")),
+    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10"))
   )
 
-# Build empty 'mids' where only indfmpir is imputed
-meth <- make.method(mi_vars)
-pred <- make.predictorMatrix(mi_vars)
-
-# Only INDFMPIR is imputed via PMM; all others "" (no imputation)
-meth[] <- ""
-meth["indfmpir"] <- "pmm"
-
-# Predictor set for INDFMPIR
-pred[,] <- 0
-pred["indfmpir", c("ed_cat","age_years","sex","race_eth","insured")] <- 1
-
-imp <- mice(
-  mi_vars,
-  m = 20, maxit = 10,
-  method = meth,
-  predictorMatrix = pred,
-  seed = 123,
-  printFlag = FALSE
+desc_design <- svydesign(
+  ids     = ~ sdmvpsu,
+  strata  = ~ sdmvstra,
+  weights = ~ wtint_pool,
+  nest    = TRUE,
+  data    = desc_df
 )
 
-# Derive INDFMPIR categories within each completed dataset
-cut_pir <- function(x) {
-  case_when(
-    is.na(x)            ~ NA_character_,
-    x < 1               ~ "<1.00 (below poverty)",
-    x >= 1 & x < 2      ~ "1.00–1.99",
-    x >= 2 & x < 4      ~ "2.00–3.99",
-    x >= 4              ~ "≥4.00"
-  ) %>% factor(levels = c("<1.00 (below poverty)","1.00–1.99","2.00–3.99","≥4.00"))
-}
+cont_vars   <- c("rxdcount","comorbidity_n","cci_score")
+n_overall   <- nrow(desc_df)
+n_by_poly   <- table(desc_df$poly_cat)
+poly_levels <- levels(desc_df$poly_cat)
 
-# Complete to a list of data.frames with derived indfmpir_cat
-comp_list <- lapply(1:imp$m, function(i) {
-  di <- complete(imp, i)
-  di %>% mutate(indfmpir_cat = cut_pir(indfmpir))
-})
-
-# Build survey designs for each imputed dataset
-design_list <- lapply(comp_list, function(di) {
-  svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-            nest = TRUE, data = di)
-})
-
-# Helper to get complete-case subset inside each imputed dataset
-cc_vars <- c("age_cat","sex","race_eth","ed_cat","indfmpir_cat","insured",
-             "poly_cat","comorbidity_n","cci_score","visits_cat","hosp_stays_cat",
-             "time_y","event")
-design_list <- lapply(design_list, function(dd) {
-  dd <- update(dd,
-               age_cat = factor(case_when(
-                          ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-                          ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-                          ridageyr >= 80                 ~ "80 or above"),
-                          levels = c("45-64","65-79","80 or above")),
-               poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10"))
+# Continuous (survey-weighted)
+tbl_cont_exposure <- gtsummary::tbl_svysummary(
+  data      = desc_design,
+  by        = poly_cat,
+  include   = all_of(cont_vars),
+  statistic = list(gtsummary::all_continuous() ~ "{mean} ({sd})"),
+  missing   = "no",
+  label     = list(
+    rxdcount      ~ "Medication count",
+    comorbidity_n ~ "Number of comorbidities",
+    cci_score     ~ "Charlson-like comorbidity score"
   )
-  cc_idx <- complete.cases(dd$variables[, cc_vars])
-  subset(dd, cc_idx)
-})
-```
-
-# Descriptive statistics (MI-completed, imputation #1)
-
-For clarity and reproducibility, we present descriptives using **imputed dataset #1** (fully completed). Continuous variables are **survey‑weighted mean (SD)**; categorical are **unweighted n (%)**. Each table includes an **Overall** column.
-
-```{r descriptives, results='asis'}
-d1 <- design_list[[1]]
-dat1 <- d1$variables %>%
-  mutate(event_f = factor(event, levels = c(0,1), labels = c("Alive/Censored","Deceased")))
-
-cont_vars <- c("rxdcount","comorbidity_n","cci_score")
-
-# ========== BY OUTCOME ==========
-n_alive <- sum(dat1$event_f == "Alive/Censored", na.rm = TRUE)
-n_deceased <- sum(dat1$event_f == "Deceased", na.rm = TRUE)
-n_overall <- nrow(dat1)
-
-tbl_cont_outcome <- tbl_svysummary(
-  data = d1, by = event, include = all_of(cont_vars),
-  statistic = list(all_continuous() ~ "{mean} ({sd})"), missing = "no",
-  label = list(rxdcount ~ "Medication count", comorbidity_n ~ "Number of comorbidities",
-               cci_score ~ "Charlson-like comorbidity score")
 ) %>%
-  add_overall() %>%
-  modify_header(
-    stat_1 ~ paste0("**0**  \nN = ", format(n_alive, big.mark = ",")),
-    stat_2 ~ paste0("**1**  \nN = ", format(n_deceased, big.mark = ",")),
-    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
-  ) %>% bold_labels()
-
-tbl_cat_outcome <- tbl_summary(
-  data = dat1, by = event_f,
-  include = all_of(intersect(c("poly_cat","age_cat","sex","race_eth","ed_cat",
-                  "indfmpir_cat","insured","visits_cat","hosp_stays_cat"), names(dat1))),
-  type = list(all_categorical() ~ "categorical"),
-  statistic = list(all_categorical() ~ "{n} ({p}%)"), missing = "no",
-  label = list(poly_cat ~ "Polypharmacy (ref = 1–4)", age_cat ~ "Age group",
-               sex ~ "Sex", race_eth ~ "Race/ethnicity", ed_cat ~ "Education",
-               indfmpir_cat ~ "Income-to-poverty ratio", insured ~ "Insurance coverage",
-               visits_cat ~ "Doctor visits in past year", hosp_stays_cat ~ "Hospital stays in past year")
-) %>%
-  add_overall() %>%
-  modify_header(
-    stat_1 ~ paste0("**Alive/Censored**  \nN = ", format(n_alive, big.mark = ",")),
-    stat_2 ~ paste0("**Deceased**  \nN = ", format(n_deceased, big.mark = ",")),
-    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
-  ) %>% bold_labels()
-
-tbl_outcome_merged <- tbl_stack(tbls = list(tbl_cont_outcome, tbl_cat_outcome)) %>%
-  modify_caption("**Descriptive statistics by outcome (imputation #1)**") %>%
-  modify_footnote(update = all_stat_cols() ~
-      "N represents unweighted sample size. Continuous variables are summarized with survey-weighted mean (SD). Categorical variables are summarized with unweighted n (column %)."
-  ) %>% bold_labels()
-
-as_gt(tbl_outcome_merged)
-
-# ========== BY EXPOSURE ==========
-dat1 <- dat1 %>% mutate(poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")))
-n_by_poly <- table(dat1$poly_cat)
-poly_levels <- levels(dat1$poly_cat)
-
-tbl_cont_exposure <- tbl_svysummary(
-  data = d1, by = poly_cat, include = all_of(cont_vars),
-  statistic = list(all_continuous() ~ "{mean} ({sd})"), missing = "no",
-  label = list(rxdcount ~ "Medication count", comorbidity_n ~ "Number of comorbidities",
-               cci_score ~ "Charlson-like comorbidity score")
-) %>% add_overall() %>% bold_labels()
+  gtsummary::add_overall() %>%
+  gtsummary::bold_labels()
 
 for (i in seq_along(poly_levels)) {
   tbl_cont_exposure <- tbl_cont_exposure %>%
-    modify_header(!!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ", 
-                                      format(n_by_poly[poly_levels[i]], big.mark = ",")))
+    gtsummary::modify_header(
+      !!paste0("stat_", i) :=
+        paste0("**", poly_levels[i], "**  \nN = ", format(n_by_poly[poly_levels[i]], big.mark = ","))
+    )
 }
 tbl_cont_exposure <- tbl_cont_exposure %>%
-  modify_header(stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ",")))
+  gtsummary::modify_header(
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  )
 
-tbl_cat_exposure <- tbl_summary(
-  data = dat1, by = poly_cat,
-  include = all_of(intersect(c("event_f","age_cat","sex","race_eth","ed_cat",
-                  "indfmpir_cat","insured","visits_cat","hosp_stays_cat"), names(dat1))),
-  type = list(all_categorical() ~ "categorical"),
-  statistic = list(all_categorical() ~ "{n} ({p}%)"), missing = "no",
-  label = list(event_f ~ "Mortality status", age_cat ~ "Age group", sex ~ "Sex",
-               race_eth ~ "Race/ethnicity", ed_cat ~ "Education",
-               indfmpir_cat ~ "Income-to-poverty ratio", insured ~ "Insurance coverage",
-               visits_cat ~ "Doctor visits in past year", hosp_stays_cat ~ "Hospital stays in past year")
-) %>% add_overall(last = TRUE) %>% bold_labels()
+# Categorical (unweighted n, weighted % conceptually but we keep unweighted counts here)
+tbl_cat_exposure <- gtsummary::tbl_summary(
+  data     = desc_df,
+  by       = poly_cat,
+  include  = c(
+    "event","age_cat","sex","race_eth","ed_cat",
+    "indfmpir_cat_obs","insured_obs","visits_cat","hosp_stays_cat"
+  ) %>% intersect(names(desc_df)),
+  statistic = list(gtsummary::all_categorical() ~ "{n} ({p}%)"),
+  missing   = "no",
+  label     = list(
+    event            ~ "Mortality status",
+    age_cat          ~ "Age group",
+    sex              ~ "Sex",
+    race_eth         ~ "Race/ethnicity",
+    ed_cat           ~ "Education",
+    indfmpir_cat_obs ~ "Income-to-poverty ratio",
+    insured_obs      ~ "Insurance coverage",
+    visits_cat       ~ "Doctor visits in past year",
+    hosp_stays_cat   ~ "Hospital stays in past year"
+  )
+) %>%
+  gtsummary::add_overall(last = TRUE) %>%
+  gtsummary::bold_labels()
 
 for (i in seq_along(poly_levels)) {
   tbl_cat_exposure <- tbl_cat_exposure %>%
-    modify_header(!!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ", 
-                                      format(n_by_poly[poly_levels[i]], big.mark = ",")))
+    gtsummary::modify_header(
+      !!paste0("stat_", i) :=
+        paste0("**", poly_levels[i], "**  \nN = ", format(n_by_poly[poly_levels[i]], big.mark = ","))
+    )
 }
 tbl_cat_exposure <- tbl_cat_exposure %>%
-  modify_header(stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ",")))
+  gtsummary::modify_header(
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  )
 
-tbl_exposure_merged <- tbl_stack(tbls = list(tbl_cont_exposure, tbl_cat_exposure)) %>%
-  modify_caption("**Descriptive statistics by exposure (polypharmacy)**") %>%
-  modify_footnote(update = all_stat_cols() ~
-      "N represents unweighted sample size. Continuous variables are survey-weighted; categorical variables are unweighted."
-  ) %>% bold_labels()
+gtsummary::tbl_stack(list(tbl_cont_exposure, tbl_cat_exposure)) %>%
+  gtsummary::modify_caption("**Descriptive statistics by polypharmacy (observed; missing income/insurance shown as categories)**")
+```
 
-as_gt(tbl_exposure_merged)
+## **Descriptive statistics by outcome status**
+
+We also present sample characteristics stratified by vital status at the end of follow-up to examine differences between those who survived and those who died during follow-up.
+
+```{r descriptives-by-outcome}
+# Create a factor version of event for better labeling
+desc_df <- desc_df %>%
+  mutate(
+    event_factor = factor(event, 
+                         levels = c(0, 1), 
+                         labels = c("Alive/Censored", "Deceased"))
+  )
+
+# Update survey design with the new factor
+desc_design_outcome <- svydesign(
+  ids     = ~ sdmvpsu,
+  strata  = ~ sdmvstra,
+  weights = ~ wtint_pool,
+  nest    = TRUE,
+  data    = desc_df
+)
+
+n_by_outcome <- table(desc_df$event_factor)
+outcome_levels <- levels(desc_df$event_factor)
+
+# Continuous variables (survey-weighted) by outcome
+tbl_cont_outcome <- gtsummary::tbl_svysummary(
+  data      = desc_design_outcome,
+  by        = event_factor,
+  include   = all_of(cont_vars),
+  statistic = list(gtsummary::all_continuous() ~ "{mean} ({sd})"),
+  missing   = "no",
+  label     = list(
+    rxdcount      ~ "Medication count",
+    comorbidity_n ~ "Number of comorbidities",
+    cci_score     ~ "Charlson-like comorbidity score"
+  )
+) %>%
+  gtsummary::add_overall() %>%
+  gtsummary::bold_labels()
+
+for (i in seq_along(outcome_levels)) {
+  tbl_cont_outcome <- tbl_cont_outcome %>%
+    gtsummary::modify_header(
+      !!paste0("stat_", i) :=
+        paste0("**", outcome_levels[i], "**  \nN = ", format(n_by_outcome[outcome_levels[i]], big.mark = ","))
+    )
+}
+tbl_cont_outcome <- tbl_cont_outcome %>%
+  gtsummary::modify_header(
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  )
+
+# Categorical variables by outcome (excluding event itself)
+tbl_cat_outcome <- gtsummary::tbl_summary(
+  data     = desc_df,
+  by       = event_factor,
+  include  = c(
+    "poly_cat","age_cat","sex","race_eth","ed_cat",
+    "indfmpir_cat_obs","insured_obs","visits_cat","hosp_stays_cat"
+  ) %>% intersect(names(desc_df)),
+  statistic = list(gtsummary::all_categorical() ~ "{n} ({p}%)"),
+  missing   = "no",
+  label     = list(
+    poly_cat         ~ "Polypharmacy category",
+    age_cat          ~ "Age group",
+    sex              ~ "Sex",
+    race_eth         ~ "Race/ethnicity",
+    ed_cat           ~ "Education",
+    indfmpir_cat_obs ~ "Income-to-poverty ratio",
+    insured_obs      ~ "Insurance coverage",
+    visits_cat       ~ "Doctor visits in past year",
+    hosp_stays_cat   ~ "Hospital stays in past year"
+  )
+) %>%
+  gtsummary::add_overall(last = TRUE) %>%
+  gtsummary::bold_labels()
+
+for (i in seq_along(outcome_levels)) {
+  tbl_cat_outcome <- tbl_cat_outcome %>%
+    gtsummary::modify_header(
+      !!paste0("stat_", i) :=
+        paste0("**", outcome_levels[i], "**  \nN = ", format(n_by_outcome[outcome_levels[i]], big.mark = ","))
+    )
+}
+tbl_cat_outcome <- tbl_cat_outcome %>%
+  gtsummary::modify_header(
+    stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
+  )
+
+gtsummary::tbl_stack(list(tbl_cont_outcome, tbl_cat_outcome)) %>%
+  gtsummary::modify_caption("**Descriptive statistics by vital status (observed; missing income/insurance shown as categories)**")
 ```
 
 \newpage
 
 # Kaplan–Meier curves by polypharmacy + log-rank test
 
-We present a weighted Kaplan-Meier survival curves stratified by polypharmacy category to visualize crude survival patterns over follow-up time.
+We present weighted Kaplan-Meier survival curves stratified by polypharmacy category to visualize crude survival patterns over follow-up time. The survey-weighted approach accounts for NHANES' complex sampling design, ensuring our survival estimates are representative of the U.S. population.
 
 ```{r km-curves, fig.width=8, fig.height=6, fig.cap="Kaplan-Meier survival curves by polypharmacy category"}
 # ---- Survey-weighted Kaplan–Meier by polypharmacy (full time; no SE/CI) -----
-
-# Complete imputation #1 for descriptive plots 
-di1 <- mice::complete(imp, 1) %>%
-  dplyr::mutate(
-    poly_cat = factor(poly_cat, levels = c("0", "1–4", "5–9", "≥10"))
-  )
-
-# Survey design (pooled interview weights)
-dd1 <- svydesign(
+dd_km <- svydesign(
   ids     = ~ sdmvpsu,
   strata  = ~ sdmvstra,
   weights = ~ wtint_pool,
   nest    = TRUE,
-  data    = di1
+  data    = desc_df
 )
 
-# One stratified svykm() call over full follow-up (no SE, no CI)
-km_fit <- svykm(
-  survival::Surv(time_y, event) ~ poly_cat,
-  design = dd1,
-  se = FALSE, ci = FALSE
-)
+km_fit <- svykm(Surv(time_y, event) ~ poly_cat, design = dd_km, se = FALSE, ci = FALSE)
 
-# Tidy the list of curves for ggplot
 km_df <- purrr::imap_dfr(km_fit, function(fit, grp) {
-  tibble::tibble(
+  tibble(
     time     = fit$time,
     surv     = fit$surv,
     poly_cat = grp
   )
 })
 
-# Plot (weighted KM curves)
-ggplot2::ggplot(km_df, ggplot2::aes(x = time, y = surv, color = poly_cat)) +
-  ggplot2::geom_step(linewidth = 0.9) +
-  ggplot2::scale_y_continuous(
-    labels = scales::percent_format(accuracy = 1),
-    limits = c(0, 1)
-  ) +
-  ggplot2::labs(
+ggplot(km_df, aes(x = time, y = surv, color = poly_cat)) +
+  geom_step(linewidth = 0.9) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(
     title = "Survey-weighted Kaplan–Meier survival by medication category",
-    x = "Years since interview",
-    y = "Survival probability",
-    color = "Polypharmacy"
+    x     = "Years since interview",
+    y     = "Survival probability",
+    color = "Medication use category"
   ) +
-  ggplot2::theme_minimal(base_size = 12) +
-  ggplot2::theme(
-    legend.position = "right",
-    panel.grid.minor = ggplot2::element_blank()
-  )
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
 
-# -------------------------- Design-based log-rank tests ------------------------
-
-if ("svylogrank" %in% getNamespaceExports("survey")) {
-  lr_test <- svylogrank(survival::Surv(time_y, event) ~ poly_cat, design = dd1)
-  omni_tbl <- tibble::tibble(
-    test      = "Design-based log-rank (svylogrank)",
-    statistic = unname(lr_test$statistic),
-    df        = lr_test$parameter,
-    p_value   = lr_test$p.value
-  )
-} else {
-  # Omnibus design-based test via Cox + Rao–Scott (regTermTest)
-  fit_lr  <- svycoxph(survival::Surv(time_y, event) ~ poly_cat, design = dd1)
-  omnibus <- regTermTest(fit_lr, ~ poly_cat)
-  omni_tbl <- tibble::tibble(
-    test      = "Design-based log-rank (Cox/regTermTest)",
-    statistic = unname(omnibus$Ftest),
-    df_num    = omnibus$df[1],
-    df_den    = omnibus$df[2],
-    p_value   = omnibus$p
-  )
-}
+# design-based omnibus test (via Cox + regTermTest)
+fit_lr  <- svycoxph(Surv(time_y, event) ~ poly_cat, design = dd_km)
+omni    <- regTermTest(fit_lr, ~ poly_cat)
 
 knitr::kable(
-  omni_tbl,
+  tibble(
+    test = "Design-based log-rank (via Cox/regTermTest)",
+    F    = omni$Ftest,
+    df1  = omni$df[1],
+    df2  = omni$df[2],
+    p    = omni$p
+  ),
   digits = 4,
-  caption = "Omnibus design-based log-rank test across medication-use categories"
-)
-
-# Pairwise design-based comparisons (2-group Cox per contrast with Holm adjust)
-lvls <- levels(di1$poly_cat)
-pairs <- utils::combn(lvls, 2, simplify = FALSE)
-
-sink(tempfile())
-pair_tbl <- purrr::map_dfr(pairs, function(pr) {
-  dsub <- subset(dd1, poly_cat %in% pr)
-  # Relevel to ensure the first element of the pair is the reference
-  dsub <- update(dsub, poly2 = factor(poly_cat, levels = pr))
-  f2   <- svycoxph(survival::Surv(time_y, event) ~ poly2, design = dsub)
-
-  cs <- summary(f2)$coefficients
-  p  <- if (!is.null(cs) && nrow(cs) >= 1) {
-    if ("Pr(>|z|)" %in% colnames(cs)) cs[1, "Pr(>|z|)"]
-    else if ("p" %in% colnames(cs))    cs[1, "p"]
-    else NA_real_
-  } else {
-    NA_real_
-  }
-
-  tibble::tibble(
-    contrast = paste0(pr[1], " vs ", pr[2]),
-    p_value  = as.numeric(p)
-  )
-}) %>%
-  dplyr::mutate(p_value_adj = p.adjust(p_value, method = "holm"))
-sink()
-
-knitr::kable(
-  pair_tbl,
-  digits = 4,
-  caption = "Pairwise design-based log-rank (survey-weighted Cox) comparisons with Holm adjustment"
+  caption = "Omnibus design-based test of equality of survival functions across medication-use categories"
 )
 ```
 
 \newpage
 
-# Cox PH models (MI pooled): crude → basic → full
+# **Missingness review (post-eligibility)**
 
-We fit three Cox proportional hazards models across the **20 imputed datasets** and pool estimates using Rubin's rules. The reference exposure category is **1–4 medications**.
+Before proceeding with multiple imputation, we systematically assess patterns of missingness in our key variables. We focus particularly on income-to-poverty ratio (INDFMPIR) and insurance status (INSURED), as these socioeconomic variables often exhibit complex patterns of non-response. We use both visual inspection and logistic regression models to test whether missingness is associated with observed characteristics—a key assumption for multiple imputation under the missing at random (MAR) framework.
 
-```{r cox-models}
-# Helpers to (re)build analysis variables inside each completed dataset
-mk_indfmpir_cat <- function(indfmpir) {
-    forcats::fct_relevel(dplyr::case_when(
-            is.na(indfmpir) ~ NA_character_, indfmpir < 1 ~ "<1.00 (below poverty)",
-            indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
-            indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99", indfmpir >= 4 ~ "≥4.00"),
-        "<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00")
-}
+```{r missingness-review}
+# Define variables to assess for missingness
+miss_vars <- c(
+  "indfmpir","insured","age_years","sex","race_eth","ed_cat",
+  "comorbidity_n","cci_score","visits_cat","hosp_stays_cat"
+)
 
+# Variable-wise missingness summary (counts & %)
+miss_summary <- elig_df %>%
+  miss_var_summary(include = dplyr::all_of(miss_vars))
+
+knitr::kable(
+  miss_summary,
+  digits = 2,
+  caption = "Variable-wise missingness summary"
+) %>%
+  kableExtra::kable_styling()
+
+# Visual missingness plot
+plot_missing(elig_df[, miss_vars])
+
+# Create missingness indicators for further analysis
+elig_df <- elig_df %>%
+  mutate(
+    miss_indfmpir = factor(ifelse(is.na(indfmpir), "Missing","Observed")),
+    miss_insured  = factor(ifelse(is.na(insured),  "Missing","Observed"))
+  )
+```
+
+## Logistic regression models for missingness
+
+We fit logistic regression models to predict missingness in income-to-poverty ratio and insurance status. These models help us understand whether missingness is related to other observed characteristics (supporting the MAR assumption) or appears completely at random (MCAR). Significant associations between missingness and observed covariates suggest that our imputation model should include these predictors to properly account for the missingness mechanism.
+
+For income-to-poverty ratio, we include all analysis variables except the variable itself. For insurance status, we similarly include all other analysis variables. This comprehensive approach ensures our imputation model captures the relationships between missingness and observed data.
+
+```{r missingness-logistic}
+# Logistic model for INDFMPIR missingness
+# We include all variables that will be used in the imputation model
+fit_miss_indf <- glm(
+  I(is.na(indfmpir)) ~ 
+    age_years + sex + race_eth + ed_cat + insured + 
+    comorbidity_n + cci_score + visits_cat + hosp_stays_cat +
+    poly_cat + rxdcount,
+  data = elig_df, 
+  family = binomial()
+)
+
+# Logistic model for INSURED missingness
+fit_miss_ins <- glm(
+  I(is.na(insured)) ~ 
+    age_years + sex + race_eth + ed_cat + indfmpir + 
+    comorbidity_n + cci_score + visits_cat + hosp_stays_cat +
+    poly_cat + rxdcount,
+  data = elig_df, 
+  family = binomial()
+)
+
+# Display results for INDFMPIR missingness model
+indf_miss_tbl <- broom::tidy(fit_miss_indf, exponentiate = TRUE, conf.int = TRUE) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 3))) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value)
+
+knitr::kable(
+  indf_miss_tbl,
+  caption = "Logistic regression for INDFMPIR missingness (odds ratios)"
+) %>%
+  kableExtra::kable_styling()
+
+# Display results for INSURED missingness model
+ins_miss_tbl <- broom::tidy(fit_miss_ins, exponentiate = TRUE, conf.int = TRUE) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 3))) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value)
+
+knitr::kable(
+  ins_miss_tbl,
+  caption = "Logistic regression for INSURED missingness (odds ratios)"
+) %>%
+  kableExtra::kable_styling()
+```
+
+**Interpretation:** The logistic regression models reveal that missingness in both INDFMPIR and INSURED is systematically associated with observed demographic and health characteristics, rejecting the missing completely at random (MCAR) assumption. For INDFMPIR, we observe significant associations with age, race/ethnicity, education, insurance status, and healthcare utilization patterns. Similarly, insurance missingness varies significantly by age, race/ethnicity, education, and income level. These patterns support the missing at random (MAR) assumption, conditional on observed covariates, justifying our multiple imputation approach. We proceed with multiple imputation using all observed predictors, including a Nelson-Aalen cumulative hazard term to incorporate information from the survival outcome as recommended by White & Royston (2009).
+
+\newpage
+
+# **Multiple imputation (indfmpir, insured) with Nelson–Aalen hazard**
+
+We now build an imputation model that:
+
+-   imputes **both** income-to-poverty ratio (indfmpir) using predictive mean matching (PMM) and insurance (insured) using logistic regression;
+
+-   includes the **survey design** variables (PSU, strata, weight) so they are available downstream;
+
+-   includes a **Nelson–Aalen cumulative hazard** built from the observed survival, as recommended by White & Royston (2009) to ensure the outcome informs the imputation process.
+
+The Nelson-Aalen cumulative hazard captures information about the survival outcome without requiring event/censoring indicators to be included as predictors directly. This approach has been shown to reduce bias when imputing covariates in survival analyses.
+
+```{r mi-nelson-aalen}
+# Overall (unweighted) Nelson–Aalen from the eligible sample
+sf_all  <- survfit(Surv(time_y, event) ~ 1, data = elig_df)
+na_fun  <- stepfun(sf_all$time, c(0, sf_all$cumhaz))
+
+elig_df <- elig_df %>%
+  mutate(
+    na_cumhaz = na_fun(time_y)
+  )
+```
+
+```{r mi-run}
+## 1) Build imputation-ready data ----
+mi_dat <- elig_df %>%
+  mutate(
+    # make insurance strictly binary for MI
+    insured = case_when(
+      insured == "Yes" ~ "Yes",
+      insured == "No"  ~ "No",
+      TRUE             ~ NA_character_
+    ),
+    insured = factor(insured, levels = c("No","Yes"))
+  ) %>%
+  transmute(
+    seqn,
+    sdmvpsu, sdmvstra, wtint_pool,     # survey design vars
+    time_y, event, na_cumhaz,          # survival info
+    rxdcount,
+    poly_cat,
+    ridageyr,
+    age_cat,
+    sex,
+    race_eth,
+    ed_cat,
+    indfmpir,
+    insured,
+    comorbidity_n,
+    cci_score,
+    visits_cat,
+    hosp_stays_cat,
+    rx_antineoplastic,
+    rx_cns,
+    rx_cardiovascular,
+    rx_psychotherapeutic
+  )
+
+## 2) Methods & predictor matrix ----
+meth <- make.method(mi_dat)
+pred <- make.predictorMatrix(mi_dat)
+
+# start from: "impute nothing"
+meth[] <- ""
+
+# we only want to impute these two:
+meth["indfmpir"] <- "pmm"
+meth["insured"]  <- "logreg"
+
+# allow all vars to help predict, but:
+# - design vars should be available as predictors
+# - they themselves are not imputed
+pred[] <- 0
+
+# indfmpir uses (almost) everything
+pred["indfmpir", ] <- 1
+# but not itself
+pred["indfmpir", "indfmpir"] <- 0
+
+# insured uses (almost) everything
+pred["insured", ] <- 1
+pred["insured", "insured"] <- 0
+
+# we do NOT impute these:
+no_impute <- c("seqn","sdmvpsu","sdmvstra","wtint_pool","time_y","event","na_cumhaz")
+meth[no_impute] <- ""
+# they can still be used as predictors, so we keep pred[...] = 1 for rows above
+
+## 3) Run MI ----
+# We use m=20 imputations and maxit=20 iterations to ensure convergence
+imp <- mice(
+  mi_dat,
+  m       = 20,
+  maxit   = 20,
+  method  = meth,
+  predictorMatrix = pred,
+  seed    = 604,
+  printFlag = FALSE  # Suppress iteration messages
+)
+
+# Quick visual check of convergence (suppressing plot messages)
+invisible(plot(imp, c("indfmpir","insured")))
+```
+
+\newpage
+
+# **Helper functions**
+
+We define helper functions to consistently categorize age and income-to-poverty ratio across all model specifications. This ensures reproducibility and reduces coding errors.
+
+```{r helpers}
 mk_age_cat <- function(ridageyr) {
-    factor(dplyr::case_when(
-        ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-        ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-        ridageyr >= 80 ~ "80 or above"), levels = c("45-64","65-79","80 or above"))
+  factor(case_when(
+    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
+    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
+    ridageyr >= 80                 ~ "80 or above"
+  ), levels = c("45-64","65-79","80 or above"))
 }
 
-# CRUDE (poly_cat only; ref = 1–4 meds)
+mk_indfmpir_cat <- function(x) {
+  factor(case_when(
+    is.na(x)              ~ NA_character_,
+    x < 1                 ~ "<1.00 (below poverty)",
+    x >= 1 & x < 2        ~ "1.00–1.99",
+    x >= 2 & x < 4        ~ "2.00–3.99",
+    x >= 4                ~ "≥4.00"
+  ), levels = c("<1.00 (below poverty)","1.00–1.99","2.00–3.99","≥4.00"))
+}
+```
+
+\newpage
+
+# **Main Cox models (crude → basic → full)**
+
+We fit three progressively adjusted Cox proportional hazards models to examine the association between polypharmacy and all-cause mortality. The crude model includes only the exposure variable, the basic model adds demographic adjustments (age, sex, race/ethnicity), and the full model includes all a priori confounders including socioeconomic status, comorbidity burden, and healthcare utilization. All models use survey weights and account for the complex survey design. We use Rubin's rules to pool estimates across the 20 imputed datasets.
+
+```{r cox-main}
+# Crude model: exposure only
 fit_crude <- with(imp, {
-  di <- tibble::tibble(
+  di <- tibble(
     sdmvpsu, sdmvstra, wtint_pool, time_y, event,
     poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10"))
   )
@@ -508,33 +644,34 @@ fit_crude <- with(imp, {
   svycoxph(Surv(time_y, event) ~ poly_cat, design = dd)
 })
 
-# BASIC (+ age/sex/race)
+# Basic model: add demographics
 fit_basic <- with(imp, {
-  di <- tibble::tibble(
+  di <- tibble(
     sdmvpsu, sdmvstra, wtint_pool, time_y, event,
     poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
     age_cat  = mk_age_cat(ridageyr),
     sex, race_eth
-  )  %>% 
-    dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+  ) %>%
+    mutate(across(where(is.factor), fct_drop))
   dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
                   nest = TRUE, data = di)
   svycoxph(Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth, design = dd)
 })
 
-# FULL (+ education, PIR, insurance, comorbidity, CCI, utilization)
+# Full model: add all confounders
 fit_full <- with(imp, {
-  di <- tibble::tibble(
+  di <- tibble(
     sdmvpsu, sdmvstra, wtint_pool, time_y, event,
     poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
-    age_cat  = mk_age_cat(ridageyr), sex, race_eth, ed_cat,
+    age_cat  = mk_age_cat(ridageyr),
+    sex, race_eth, ed_cat,
     insured  = factor(insured, levels = c("No","Yes")),
     indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
     comorbidity_n = as.numeric(comorbidity_n),
     cci_score     = as.numeric(cci_score),
     visits_cat, hosp_stays_cat
   ) %>%
-    dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+    mutate(across(where(is.factor), fct_drop))
   dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
                   nest = TRUE, data = di)
   svycoxph(
@@ -544,263 +681,6 @@ fit_full <- with(imp, {
     design = dd
   )
 })
-
-# Variable labels
-labels_crude <- list(poly_cat ~ "Polypharmacy")
-labels_basic <- list(poly_cat ~ "Polypharmacy", age_cat ~ "Age group",
-    sex ~ "Sex", race_eth ~ "Race/ethnicity")
-labels_full <- list(poly_cat ~ "Polypharmacy", age_cat ~ "Age group",
-    sex ~ "Sex", race_eth ~ "Race/ethnicity", ed_cat ~ "Education",
-    indfmpir_cat ~ "Income-to-poverty ratio", insured ~ "Insurance coverage",
-    comorbidity_n ~ "Number of comorbidities",
-    cci_score ~ "Charlson-like comorbidity index",
-    visits_cat ~ "Doctor visits in past year", 
-    hosp_stays_cat ~ "Hospital stays in past year")
-
-# Create gtsummary tables for each model
-sink(tempfile())
-tbl_crude <- gtsummary::tbl_regression(fit_crude, exponentiate = TRUE,
-    label = labels_crude) %>% gtsummary::bold_labels()
-tbl_basic <- gtsummary::tbl_regression(fit_basic, exponentiate = TRUE,
-    label = labels_basic) %>% gtsummary::bold_labels()
-tbl_full <- gtsummary::tbl_regression(fit_full, exponentiate = TRUE,
-    label = labels_full) %>% gtsummary::bold_labels()
-sink()
-
-# Merge all three models into one table
-tbl_combined <- gtsummary::tbl_merge(
-    tbls = list(tbl_crude, tbl_basic, tbl_full),
-    tab_spanner = c("**Crude Model**", "**Basic Model**", "**Full Model**")) %>%
-    gtsummary::modify_caption("**Survey-weighted Cox proportional hazards models for all-cause mortality**") %>%
-    gtsummary::modify_footnote(update = gtsummary::all_stat_cols() ~ 
-            "HR = hazard ratio; CI = confidence interval. Models account for complex survey design and multiple imputation. Reference category for polypharmacy is 1–4 medications.") %>%
-    gtsummary::bold_labels()
-
-tbl_combined_gt <- gtsummary::as_gt(tbl_combined) %>%
-    gt::tab_source_note(gt::md("**Notes.** Crude model: unadjusted. Basic model: adjusted for age, sex, and race/ethnicity. Full model: additionally adjusted for education, income-to-poverty ratio, insurance, comorbidities, and healthcare utilization."))
-```
-
-```{r cox-table, results='asis'}
-tbl_combined_gt
-```
-
-**Interpretation:** The crude model shows the unadjusted associations between polypharmacy categories and mortality risk. The basic model adjusts for demographics (age, sex, race/ethnicity), while the full model additionally adjusts for socioeconomic factors, comorbidities, and healthcare utilization patterns.
-
-\newpage
-
-# Stratification descriptive statistics by 4 therapeutic-class: Antineoplastic agents, CNS agents, cardiovascular agents, and psychotherapeutic agents
-
-We summarize each therapeutic-class cohort (users only), stratified by polypharmacy.
-```{r}
-# ---- Descriptives by exposure within therapeutic-class user cohorts ----------
-# Continuous variables are survey-weighted; categorical variables are unweighted.
-# Column headers show UNWEIGHTED N for each exposure level + an Overall column.
-
-# pull the RX class indicators we need from the master (already joined to analytic_raw upstream)
-rx_all <- analytic_raw %>%
-  dplyr::select(
-    seqn,
-    rxdcount,
-    rx_respiratory,
-    rx_cns,
-    rx_cardiovascular,
-    rx_topical,
-    rx_hormone,
-    rx_psychotherapeutic,
-    rx_metabolic,
-    rx_coagulation,
-    rx_gastrointestinal,
-    rx_antiinfective,
-    rx_misc,
-    rx_genitourinary,
-    rx_immunologic,
-    rx_nutrition,
-    rx_antineoplastic,
-    rx_biological,
-    rx_alternative,
-    rx_radiologic,
-    rx_plasma_expander
-  )
-
-# classes to analyze
-rx_targets <- c("rx_antineoplastic", "rx_cns", "rx_cardiovascular", "rx_psychotherapeutic")
-rx_targets <- intersect(rx_targets, names(rx_all))
-
-rx_pretty <- c(
-  rx_antineoplastic    = "Antineoplastic agents",
-  rx_cns               = "CNS agents",
-  rx_cardiovascular    = "Cardiovascular agents",
-  rx_psychotherapeutic = "Psychotherapeutic agents"
-)
-
-# labels reused
-lbl_cont <- list(
-  rxdcount        ~ "Medication count",
-  comorbidity_n   ~ "Number of comorbidities",
-  cci_score       ~ "Charlson-like comorbidity score"
-)
-lbl_cat <- list(
-  event_f        ~ "Mortality status",
-  age_cat        ~ "Age group",
-  sex            ~ "Sex",
-  race_eth       ~ "Race/ethnicity",
-  ed_cat         ~ "Education",
-  indfmpir_cat   ~ "Income-to-poverty ratio",
-  insured        ~ "Insurance coverage",
-  visits_cat     ~ "Doctor visits in past year",
-  hosp_stays_cat ~ "Hospital stays in past year"
-)
-
-# helpers
-mk_indfmpir_cat <- function(indfmpir) {
-  forcats::fct_relevel(
-    dplyr::case_when(
-      is.na(indfmpir)              ~ NA_character_,
-      indfmpir < 1                 ~ "<1.00 (below poverty)",
-      indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
-      indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
-      indfmpir >= 4                ~ "≥4.00"
-    ),
-    "<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00"
-  )
-}
-mk_age_cat <- function(ridageyr) {
-  factor(dplyr::case_when(
-    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-    ridageyr >= 80                 ~ "80 or above"
-  ), levels = c("45-64","65-79","80 or above"))
-}
-ensure_ref_14 <- function(f) {
-  f <- forcats::fct_drop(f)
-  if ("1–4" %in% levels(f) && any(f == "1–4")) forcats::fct_relevel(f, "1–4") else f
-}
-
-# imputed dataset #1 for descriptives
-di1 <- mice::complete(imp, 1)
-
-# builder: ONE class cohort → gtsummary stacked table (exposure-stratified)
-build_desc_subsample_exposure <- function(flag) {
-  dat_sub <- di1 %>%
-    dplyr::mutate(
-      class_flag = dplyr::coalesce(as.integer(rx_all[[flag]][match(seqn, rx_all$seqn)]), 0L)
-    ) %>%
-    dplyr::filter(class_flag == 1L) %>%
-    dplyr::mutate(
-      poly_cat       = ensure_ref_14(factor(poly_cat, levels = c("1–4","0","5–9","≥10"))),
-      age_cat        = mk_age_cat(ridageyr),
-      indfmpir_cat   = mk_indfmpir_cat(indfmpir),
-      event_f        = factor(event, levels = c(0,1), labels = c("Alive/Censored","Deceased")),
-      rxdcount       = as.numeric(rxdcount),
-      comorbidity_n  = as.numeric(comorbidity_n),
-      cci_score      = as.numeric(cci_score)
-    )
-
-  # unweighted N for headers
-  n_overall   <- nrow(dat_sub)
-  poly_levels <- levels(dat_sub$poly_cat)
-  n_by_poly   <- table(dat_sub$poly_cat)
-
-  # survey design
-  d_sub <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-                     nest = TRUE, data = dat_sub)
-
-  cont_vars <- c("rxdcount","comorbidity_n","cci_score")
-
-  # Continuous (survey-weighted), by poly_cat
-  tbl_cont <- tbl_svysummary(
-    data       = d_sub,
-    by         = poly_cat,
-    include    = all_of(intersect(cont_vars, names(d_sub$variables))),
-    statistic  = list(all_continuous() ~ "{mean} ({sd})"),
-    missing    = "no",
-    label      = lbl_cont
-  ) %>%
-    add_overall() %>%
-    bold_labels()
-
-  for (i in seq_along(poly_levels)) {
-    tbl_cont <- tbl_cont %>%
-      modify_header(
-        !!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ",
-                                       format(n_by_poly[poly_levels[i]], big.mark = ","))
-      )
-  }
-  tbl_cont <- tbl_cont %>%
-    modify_header(
-      stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
-    )
-
-  # Categorical (unweighted), by poly_cat
-  tbl_cat <- tbl_summary(
-    data       = dat_sub,
-    by         = poly_cat,
-    include    = all_of(intersect(
-      c("event_f","age_cat","sex","race_eth","ed_cat",
-        "indfmpir_cat","insured","visits_cat","hosp_stays_cat"),
-      names(dat_sub)
-    )),
-    type       = list(all_categorical() ~ "categorical"),
-    statistic  = list(all_categorical() ~ "{n} ({p}%)"),
-    missing    = "no",
-    label      = lbl_cat
-  ) %>%
-    add_overall(last = TRUE) %>%
-    bold_labels()
-
-  for (i in seq_along(poly_levels)) {
-    tbl_cat <- tbl_cat %>%
-      modify_header(
-        !!paste0("stat_", i) := paste0("**", poly_levels[i], "**  \nN = ",
-                                       format(n_by_poly[poly_levels[i]], big.mark = ","))
-      )
-  }
-  tbl_cat <- tbl_cat %>%
-    modify_header(
-      stat_0 ~ paste0("**Overall**  \nN = ", format(n_overall, big.mark = ","))
-    )
-
-  tbl_stack(
-    tbls = list(tbl_cont, tbl_cat)
-  ) %>%
-    modify_caption(paste0("**Descriptive statistics by exposure — ",
-                          rx_pretty[flag], " users (imputation #1)**")) %>%
-    modify_footnote(
-      update = all_stat_cols() ~
-        "N represents unweighted sample size. Continuous variables are summarized with survey-weighted mean (SD). Categorical variables are summarized with unweighted n (column %)."
-    ) %>%
-    bold_labels()
-}
-
-# build all four tables
-desc_tables_sub_exposure <- purrr::map(rx_targets, build_desc_subsample_exposure)
-names(desc_tables_sub_exposure) <- rx_targets
-
-# Each table will print in place, in order:
-desc_tables_sub_exposure[[1]]
-desc_tables_sub_exposure[[2]]
-desc_tables_sub_exposure[[3]]
-desc_tables_sub_exposure[[4]]
-```
-
-\newpage
-
-# Stratification models by therapeutic-class
-
-We fit the *full* Cox model in each therapeutic-class cohort (users only), across 20 imputations, and present pooled (Rubin's rules) results in polished tables.
-```{r}
-# ---- Full models in therapeutic-class user sub-samples (MI-pooled) -----------
-
-# classes to analyze
-rx_targets <- c("rx_antineoplastic", "rx_cns", "rx_cardiovascular", "rx_psychotherapeutic")
-rx_targets <- intersect(rx_targets, names(rx_all))
-
-rx_pretty <- c(
-  rx_antineoplastic    = "Antineoplastic agents",
-  rx_cns               = "CNS agents",
-  rx_cardiovascular    = "Cardiovascular agents",
-  rx_psychotherapeutic = "Psychotherapeutic agents"
-)
 
 labels_full <- list(
   poly_cat       ~ "Polypharmacy",
@@ -816,499 +696,75 @@ labels_full <- list(
   hosp_stays_cat ~ "Hospital stays in past year"
 )
 
-mk_indfmpir_cat <- function(indfmpir) {
-  forcats::fct_relevel(
-    dplyr::case_when(
-      is.na(indfmpir)              ~ NA_character_,
-      indfmpir < 1                 ~ "<1.00 (below poverty)",
-      indfmpir >= 1 & indfmpir < 2 ~ "1.00–1.99",
-      indfmpir >= 2 & indfmpir < 4 ~ "2.00–3.99",
-      indfmpir >= 4                ~ "≥4.00"
-    ),
-    "<1.00 (below poverty)", "1.00–1.99", "2.00–3.99", "≥4.00"
-  )
-}
-mk_age_cat <- function(ridageyr) {
-  factor(dplyr::case_when(
-    ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-    ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-    ridageyr >= 80                 ~ "80 or above"
-  ), levels = c("45-64","65-79","80 or above"))
-}
-ensure_ref_14 <- function(f) {
-  f <- forcats::fct_drop(f)
-  if ("1–4" %in% levels(f) && any(f == "1–4")) forcats::fct_relevel(f, "1–4") else f
-}
-
-# Fit one full model per class among users (flag == 1) across imputations
-fit_full_subsample <- function(flag) {
-  # NOTE: use base::with so the S3 method with.mids is used
-  with(imp, {
-    di <- tibble::tibble(
-      seqn, sdmvpsu, sdmvstra, wtint_pool,
-      time_y, event, ridageyr, sex, race_eth, ed_cat, insured,
-      comorbidity_n = as.numeric(comorbidity_n),
-      cci_score     = as.numeric(cci_score),
-      rxdcount      = as.numeric(rxdcount),
-      visits_cat, hosp_stays_cat,
-      poly_cat, indfmpir
-    )
-
-    # add class flag (0/1) & subset to users
-    di[[flag]] <- dplyr::coalesce(as.integer(rx_all[[flag]][match(di$seqn, rx_all$seqn)]), 0L)
-    di <- dplyr::filter(di, .data[[flag]] == 1L)
-
-    # drop '0 meds' level if present; set 1–4 as ref when available
-    di <- di %>%
-      dplyr::mutate(
-        poly_cat       = ensure_ref_14(factor(poly_cat, levels = c("1–4","0","5–9","≥10"))),
-        age_cat        = mk_age_cat(ridageyr),
-        indfmpir_cat   = mk_indfmpir_cat(indfmpir),
-        sex            = forcats::fct_drop(sex),
-        race_eth       = forcats::fct_drop(race_eth),
-        ed_cat         = forcats::fct_drop(ed_cat),
-        indfmpir_cat   = forcats::fct_drop(indfmpir_cat),
-        insured        = forcats::fct_drop(insured),
-        visits_cat     = forcats::fct_drop(visits_cat),
-        hosp_stays_cat = forcats::fct_drop(hosp_stays_cat)
-      )
-
-    # survey design
-    invisible(utils::capture.output(
-      dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-                              nest = TRUE, data = di)
-    ))
-
-    svycoxph(
-      Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
-        ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
-        visits_cat + hosp_stays_cat,
-      design = dd
-    )
-  })
-}
-
-# pool → tidy (HR) 
-tidy_mipo_for_gts <- function(fits_mira, exponentiate = TRUE) {
-  po <- mice::pool(fits_mira)
-  sm <- summary(po, conf.int = TRUE, conf.level = 0.95)
-  if (!"conf.low" %in% names(sm) && "2.5 %" %in% names(sm)) {
-    sm <- dplyr::rename(sm, conf.low = `2.5 %`, conf.high = `97.5 %`)
-  }
-  pcol <- intersect(c("p.value", "Pr(>|t|)"), names(sm))
-  sm$p.value <- if (length(pcol) == 0) NA_real_ else sm[[pcol[1]]]
-  if (exponentiate) {
-    sm <- dplyr::mutate(sm,
-      estimate = exp(estimate),
-      conf.low = exp(conf.low),
-      conf.high = exp(conf.high)
-    )
-  }
-  dplyr::select(sm, term, estimate, conf.low, conf.high, p.value)
-}
-
-tbl_from_mira <- function(fits_mira, title, labels) {
-  sm <- tidy_mipo_for_gts(fits_mira, TRUE)
-  placeholder <- fits_mira$analyses[[1]]
-  gtsummary::tbl_regression(
-    x = placeholder,
-    exponentiate = TRUE,
-    label = labels,
-    tidy_fun = function(...) sm
-  ) %>%
-    gtsummary::modify_header(label ~ paste0("**", title, "**")) %>%
-    gtsummary::bold_labels()
-}
-
-# Fit all four class-specific models
-fits_sub <-suppressWarnings(purrr::map(rx_targets, fit_full_subsample))
-names(fits_sub) <- rx_targets
-
+# Suppress gtsummary messages
 sink(tempfile())
-# Build polished gtsummary tables
-tbls_sub <- purrr::imap(
-  fits_sub,
-  ~ tbl_from_mira(.x, paste0("Full model among ", rx_pretty[.y]), labels_full)
-)
+tbl_crude <- gtsummary::tbl_regression(fit_crude,
+                                       exponentiate = TRUE,
+                                       label = list(poly_cat ~ "Polypharmacy")) %>%
+  gtsummary::bold_labels()
 
+tbl_basic <- gtsummary::tbl_regression(fit_basic,
+                                       exponentiate = TRUE,
+                                       label = list(
+                                         poly_cat ~ "Polypharmacy",
+                                         age_cat  ~ "Age group",
+                                         sex      ~ "Sex",
+                                         race_eth ~ "Race/ethnicity"
+                                       )) %>%
+  gtsummary::bold_labels()
+
+tbl_full <- gtsummary::tbl_regression(fit_full,
+                                      exponentiate = TRUE,
+                                      label = labels_full) %>%
+  gtsummary::bold_labels()
 sink()
 
-# each will render in place
-tbls_sub[[1]]
-tbls_sub[[2]]
-tbls_sub[[3]]
-tbls_sub[[4]]
+tbl_combined <- gtsummary::tbl_merge(
+  tbls = list(tbl_crude, tbl_basic, tbl_full),
+  tab_spanner = c("**Crude model**","**Basic model**","**Full model**")
+) %>%
+  gtsummary::modify_caption("**Survey-weighted Cox proportional hazards models for all-cause mortality (MI pooled)**") %>%
+  gtsummary::modify_footnote(
+    update = gtsummary::all_stat_cols() ~
+      "HR = hazard ratio; CI = confidence interval. Reference category for polypharmacy is 1–4 medications."
+  )
+
+tbl_combined %>%
+  gtsummary::as_gt()
+
 ```
 
 \newpage
 
-# Sensitivity 1: Continuous exposure (spline)
+# **Cox model diagnostics: Multicollinearity assessment**
 
-We fit `svycoxph` with a natural cubic spline for `rxdcount` (knots at 5 & 10 medications), pool **coefficients & covariance** across imputations, then use the **delta method** to plot HRs and 95% CIs **relative to 0 medications** for a **survey‑weighted reference profile** (modes/medians).
+Before interpreting our Cox model results, we assess multicollinearity among predictors using variance inflation factors (VIF). High multicollinearity can inflate standard errors and make coefficient estimates unstable. We use generalized VIF (GVIF) which is appropriate for models with categorical predictors. For multi-degree-of-freedom terms, we report the adjusted GVIF: GVIF^(1/(2×Df)), which is comparable to standard VIF for continuous predictors.
 
-```{r spline-model, fig.width=8, fig.height=6, fig.cap="Adjusted hazard ratio vs medication count (MI pooled spline model)"}
-# ---- Spline sensitivity (MI-pooled) + non-linearity test + collinearity check ----
+Following convention, we use imputation #1 to construct an auxiliary weighted linear model with the same predictor structure as our full Cox model. The VIF values are computed from this linear model and apply to the predictor relationships in our Cox model.
 
-# 1) Fit the spline model on each imputed survey design (no poly_cat update needed)
-fit_list <- lapply(design_list, function(dd) {
-  # keep only the insured relevel (used in the model)
-  dd <- update(dd, insured = factor(insured, levels = c("No", "Yes")))
-  svycoxph(
-    Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5, 10)) +
-      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
-      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
-    design = dd
-  )
-})
-
-# Pool coefficients & vcovs across imputations
-coefs <- lapply(fit_list, coef)
-vcovs <- lapply(fit_list, vcov)
-mi_pool <- mitools::MIcombine(coefs, vcovs)
-beta    <- mi_pool$coefficients
-V       <- mi_pool$variance
-coef_nm <- names(beta)
-
-# 2) Build a reference profile from imputation #1 (survey-weighted medians/modes)
-d1 <- design_list[[1]]
-
-svy_median <- function(des, var) {
-  q <- svyquantile(as.formula(paste0("~", var)), des, quantiles = 0.5, na.rm = TRUE, ci = FALSE)
-  as.numeric(coef(q))
-}
-svy_mode <- function(des, var) {
-  tb <- svytable(as.formula(paste0("~", var)), des)
-  nm <- names(tb); nm[which.max(as.numeric(tb))]
-}
-
-dat1 <- d1$variables
-ref_age_cat_val   <- svy_mode(d1, "age_cat")
-ref_sex_val       <- svy_mode(d1, "sex")
-ref_race_val      <- svy_mode(d1, "race_eth")
-ref_ed_val        <- svy_mode(d1, "ed_cat")
-ref_pir_cat_val   <- svy_mode(d1, "indfmpir_cat")
-ref_insured_val   <- svy_mode(d1, "insured")
-ref_visits_val    <- svy_mode(d1, "visits_cat")
-ref_hosp_stays_val<- svy_mode(d1, "hosp_stays_cat")
-ref_comorb_n      <- svy_median(d1, "comorbidity_n")
-ref_cci           <- svy_median(d1, "cci_score")
-
-# 3) Prediction grid: 0..25 medications at the reference covariate profile
-pred_grid_base <- tibble::tibble(
-  rxdcount      = 0,
-  age_cat       = factor(ref_age_cat_val,   levels = levels(dat1$age_cat)),
-  sex           = factor(ref_sex_val,       levels = levels(dat1$sex)),
-  race_eth      = factor(ref_race_val,      levels = levels(dat1$race_eth)),
-  ed_cat        = factor(ref_ed_val,        levels = levels(dat1$ed_cat)),
-  indfmpir_cat  = factor(ref_pir_cat_val,   levels = levels(dat1$indfmpir_cat)),
-  insured       = factor(ref_insured_val,   levels = levels(dat1$insured)),
-  comorbidity_n = ref_comorb_n,
-  cci_score     = ref_cci,
-  visits_cat    = factor(ref_visits_val,    levels = levels(dat1$visits_cat)),
-  hosp_stays_cat= factor(ref_hosp_stays_val,levels = levels(dat1$hosp_stays_cat))
-)
-
-pred_grid <- pred_grid_base |>
-  dplyr::slice(rep(1, 26)) |>
-  dplyr::mutate(rxdcount = 0:25)
-
-# 4) Model matrix from the pooled spline model, ensure column alignment
-TT_full <- terms(fit_list[[1]])
-TT_noy  <- delete.response(TT_full)
-mf_grid <- model.frame(TT_noy, data = pred_grid,
-                       xlev = fit_list[[1]]$xlevels, na.action = na.pass)
-X <- model.matrix(TT_noy, mf_grid)
-X <- X[, coef_nm, drop = FALSE]
-
-# HRs relative to 0 medications on the reference profile
-X_ref  <- X[1, , drop = FALSE]
-Delta  <- X - matrix(X_ref, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)
-lp     <- as.vector(Delta %*% beta)
-se_lp  <- sqrt(pmax(0, rowSums((Delta %*% V) * Delta)))
-
-pred_df <- pred_grid |>
-  dplyr::mutate(
-    HR  = exp(lp),
-    LCL = exp(lp - 1.96 * se_lp),
-    UCL = exp(lp + 1.96 * se_lp)
-  )
-
-# 5) Plot: MI-pooled adjusted HR vs medication count (spline with knots 5 & 10)
-ggplot(pred_df, aes(x = rxdcount, y = HR)) +
-  geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.2) +
-  geom_line(linewidth = 1) +
-  geom_hline(yintercept = 1, linetype = 2) +
-  labs(
-    title    = "Adjusted hazard ratio vs medication count (MI pooled)",
-    subtitle = "Natural cubic spline with knots at 5 and 10",
-    x = "Medication count",
-    y = "Hazard Ratio (95% CI)"
-  ) +
-  scale_y_continuous(trans = "log10", breaks = c(0.5, 1, 2, 3, 5, 10)) +
-  theme_minimal(base_size = 12) +
-  theme(plot.title = element_text(face = "bold"),
-        panel.grid.minor = element_blank())
-
-# ------------------------------ Diagnostics -----------------------------------
-
-# (A) Wald test of non-linearity: test curvature terms = 0 after pooling
-# Build curvature-only basis (orthogonal to linear rxdcount), df=2 with knots at 5 & 10
-make_curvature_basis <- function(x, knots = c(5, 10), boundary = NULL) {
-  x <- as.numeric(x)
-  if (is.null(boundary)) boundary <- range(x, na.rm = TRUE)
-  B <- splines::ns(x, knots = knots, Boundary.knots = boundary, intercept = FALSE)  # 3 cols
-  Xlin <- matrix(x, ncol = 1)
-  proj <- Xlin %*% solve(crossprod(Xlin), crossprod(Xlin, as.matrix(B)))
-  R <- as.matrix(B) - proj
-  colnames(R) <- paste0("spl2_", seq_len(ncol(R)))  # typically 2 curvature cols when df=3
-  as.data.frame(R)
-}
-
-# Fit linear + curvature model on each imputed dataset, then pool and test
-fits_curv <- lapply(design_list, function(dd) {
-  dat <- dd$variables
-  curv <- make_curvature_basis(dat$rxdcount, knots = c(5, 10))
-  dat2 <- cbind(dat, curv)
-  dd2 <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-                   nest = TRUE, data = dat2)
-  svycoxph(
-    Surv(time_y, event) ~ rxdcount + spl2_1 + spl2_2 +
-      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
-      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
-    design = dd2
-  )
-})
-
-coefs_c <- lapply(fits_curv, coef)
-vcovs_c <- lapply(fits_curv, vcov)
-mi_c    <- mitools::MIcombine(coefs_c, vcovs_c)
-
-# Wald test H0: spl2_1 = spl2_2 = 0 (no curvature; i.e., linear effect is adequate)
-beta_c <- coef(mi_c); V_c <- vcov(mi_c)
-keep   <- names(beta_c) %in% c("spl2_1", "spl2_2")
-C      <- diag(sum(keep))
-colnames(C) <- names(beta_c)[keep]; rownames(C) <- colnames(C)
-# align C to the full parameter vector
-C_full <- matrix(0, nrow = nrow(C), ncol = length(beta_c),
-                 dimnames = list(rownames(C), names(beta_c)))
-C_full[, keep] <- C
-
-W   <- as.numeric(t(C_full %*% beta_c) %*% solve(C_full %*% V_c %*% t(C_full)) %*% (C_full %*% beta_c))
-dfW <- nrow(C_full)
-pW  <- pchisq(W, df = dfW, lower.tail = FALSE)
-
-cat("\nWald test of non-linearity (curvature terms = 0): ",
-    "Chi-square = ", round(W, 2), " on ", dfW, " df; p = ", signif(pW, 3), "\n", sep = "")
-
-# (B) Multicollinearity: weighted (G)VIFs for the same predictor set (imputation #1)
-  di1 <- design_list[[1]]$variables
-  curv1 <- make_curvature_basis(di1$rxdcount, knots = c(5, 10))
-  di1c  <- cbind(di1, curv1)
-
-  # Dummy weighted linear model (response is irrelevant for VIF)
-  vif_fit <- lm(
-    rnorm(nrow(di1c)) ~ rxdcount + spl2_1 + spl2_2 +
-      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
-      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
-    data = di1c,
-    weights = wtint_pool
-  )
-
-  gv <- car::vif(vif_fit)  # GVIF for multi-df factors; VIF for 1-df terms
-
-  gv_tbl <- if (is.matrix(gv)) {
-    tibble::tibble(term = rownames(gv),
-                   GVIF = gv[, "GVIF"],
-                   Df   = gv[, "Df"],
-                   adj_GVIF = gv[, "GVIF"]^(1/(2*gv[, "Df"])))
-  } else {
-    tibble::tibble(term = names(gv), VIF = as.numeric(gv))
-  }
-
-  cat("\nWeighted (G)VIFs for spline model predictors (imputation #1):\n")
-  print(gv_tbl)
-  cat("Rule of thumb: VIF > 5 (or adjusted GVIF > ~2–3) may indicate concerning collinearity.\n")
-```
-
-**Interpretation:** This spline model allows us to examine the dose-response relationship between medication count and mortality risk continuously. The natural cubic spline with knots at 5 and 10 medications provides flexibility to capture non-linear patterns while maintaining smoothness.
-
-\newpage
-
-# Sensitivity 2: Restrict to multimorbidity (comorbidity_n ≥ 2)
-
-We repeat our full model restricting the analysis to individuals with multimorbidity (≥2 comorbidities) to assess whether the polypharmacy-mortality association persists in this high-risk subgroup.
-
-```{r sensitivity-multimorbidity}
-fit_multi <- with(imp, {
-  di <- tibble::tibble(
-    sdmvpsu, sdmvstra, wtint_pool, time_y, event, ridageyr,
-    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
-    age_cat = factor(case_when(
-      ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-      ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-      ridageyr >= 80 ~ "80 or above"), levels = c("45-64","65-79","80 or above")),
-    sex, race_eth, ed_cat,
-    insured = factor(insured, levels = c("No", "Yes")),
-    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
-    comorbidity_n = as.numeric(comorbidity_n),
-    cci_score = as.numeric(cci_score),
-    visits_cat, hosp_stays_cat
-  ) %>%
-    filter(comorbidity_n >= 2) %>%
-    dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
-  
-  dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-                     nest = TRUE, data = di)
-  svycoxph(Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
-              ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
-              visits_cat + hosp_stays_cat, design = dd)
-})
-
-sink(tempfile())
-tbl_multi <- gtsummary::tbl_regression(
-    fit_multi, exponentiate = TRUE, label = labels_full) %>%
-    gtsummary::modify_caption("**Sensitivity analysis: Restricted to multimorbidity (≥2 comorbidities)**") %>%
-    gtsummary::bold_labels()
-sink()
-```
-
-```{r sensitivity-multi-table, results='asis'}
-as_gt(tbl_multi)
-```
-
-**Interpretation:** This sensitivity analysis examines whether our findings hold among those with multimorbidity, who represent a clinically important subgroup with greater healthcare needs and medication burden.
-
-\newpage
-
-# Sensitivity 3: Exclude external‑cause deaths (ucod_leading 4 or 10)
-
-We repeat the full model after **excluding deaths due to external causes** (e.g., injuries or accidents), operationalized as `ucod_leading %in% c(4, 10)` among deaths, to focus on deaths more likely to be related to chronic disease processes.
-
-```{r sensitivity-external}
-fit_no_external <- with(imp, {
-  di <- tibble::tibble(
-    sdmvpsu, sdmvstra, wtint_pool, time_y, event, ucod_leading, ridageyr,
-    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
-    age_cat = factor(case_when(
-      ridageyr >= 45 & ridageyr < 65 ~ "45-64",
-      ridageyr >= 65 & ridageyr < 80 ~ "65-79",
-      ridageyr >= 80 ~ "80 or above"), levels = c("45-64","65-79","80 or above")),
-    sex, race_eth, ed_cat,
-    insured = factor(insured, levels = c("No", "Yes")),
-    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
-    comorbidity_n = as.numeric(comorbidity_n),
-    cci_score = as.numeric(cci_score),
-    visits_cat, hosp_stays_cat
-  ) %>%
-    filter(!(event == 1 & ucod_leading %in% c(4, 10))) %>%
-    dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
-  
-  dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-                     nest = TRUE, data = di)
-  svycoxph(Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
-              ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
-              visits_cat + hosp_stays_cat, design = dd)
-})
-
-sink(tempfile())
-tbl_no_external <- gtsummary::tbl_regression(
-    fit_no_external, exponentiate = TRUE, label = labels_full) %>%
-    gtsummary::modify_caption("**Sensitivity analysis: Excluding external-cause deaths**") %>%
-    gtsummary::bold_labels()
-sink()
-```
-
-```{r sensitivity-external-table, results='asis'}
-as_gt(tbl_no_external)
-```
-
-**Interpretation:** By excluding external-cause deaths, we can assess whether the polypharmacy-mortality association is driven primarily by disease-related deaths rather than accidental or violence-related deaths.
-
-
-
-
-# Model diagnostics (MI pooled): Full model
-
-We perform diagnostics on the full Cox model fitted via `mice::with()` across 20 imputations, assessing proportional hazards assumption, multicollinearity (GVIF), and model fit.
-
-## 1. Proportional hazards assumption (Schoenfeld residuals, MI-pooled)
-
-For each imputed dataset, we test the PH assumption using scaled Schoenfeld residuals, then pool results.
-
-```{r ph-assumption}
-# Extract PH tests from each imputed fit in the mira object
-ph_tests_list <- lapply(fit_full$analyses, function(fit_obj) {
-  # fit_obj is a svycoxph; cox.zph works on coxph objects
-  ph_test <- survival::cox.zph(fit_obj)
-  data.frame(
-    term = rownames(ph_test$table),
-    chisq = ph_test$table[, "chisq"],
-    df = ph_test$table[, "df"],
-    p_value = ph_test$table[, "p"]
-  )
-})
-
-# Pool p-values across imputations (simple average)
-n_imps <- length(ph_tests_list)
-ph_pooled <- ph_tests_list[[1]][, c("term", "df")]
-ph_pooled$chisq_mean <- sapply(seq_len(nrow(ph_pooled)), function(i) {
-  mean(sapply(ph_tests_list, function(x) x$chisq[i]), na.rm = TRUE)
-})
-ph_pooled$p_value_mean <- sapply(seq_len(nrow(ph_pooled)), function(i) {
-  mean(sapply(ph_tests_list, function(x) x$p_value[i]), na.rm = TRUE)
-})
-ph_pooled$p_value_sd <- sapply(seq_len(nrow(ph_pooled)), function(i) {
-  sd(sapply(ph_tests_list, function(x) x$p_value[i]), na.rm = TRUE)
-})
-
-ph_pooled <- ph_pooled %>%
+```{r cox-diagnostics-vif}
+# Extract completed data from imputation #1
+d1 <- mice::complete(imp, 1) %>%
   mutate(
-    term = as.character(term),
-    assumption_met = ifelse(p_value_mean < 0.05, "⚠ Violated", "✓ Holds"),
-    interpretation = ifelse(p_value_mean < 0.05, 
-                           "May violate PH; consider stratification or time-varying coef.", 
-                           "Proportional hazards assumption appears satisfied")
-  ) %>%
-  select(term, chisq_mean, df, p_value_mean, p_value_sd, assumption_met)
-
-knitr::kable(
-  ph_pooled,
-  col.names = c("Variable", "χ² (mean)", "df", "p (mean)", "p (SD across imputations)", "PH Assumption"),
-  digits = c(0, 3, 0, 4, 4, 0),
-  caption = "Proportional hazards assumption test (pooled across 20 imputations)",
-  format = "html"
-) %>% kableExtra::kable_styling()
-```
-
-**Interpretation:** Tests PH assumption for each covariate. A pooled p-value < 0.05 suggests the assumption may be violated. The SD shows variability across imputations—large SD suggests PH assessment varies by imputation.
-
-## 2. Multicollinearity: GVIF analysis (representative imputation #1)
-
-We assess multicollinearity using generalized variance inflation factors (GVIF) on the first imputation as a representative sample.
-
-```{r multicollinearity-gvif}
-# ---- Multicollinearity (GVIF) on imputation #1: auxiliary weighted LM ----
-
-# Build the same analysis frame used in the full model (imp #1)
-d1 <- design_list[[1]]$variables %>%
-  mutate(
-    # ensure identical factor levels & dropped empties as in the Cox model
+    # Ensure identical factor levels as in the Cox model
     poly_cat       = factor(poly_cat, levels = c("1–4","0","5–9","≥10")) %>% forcats::fct_drop(),
-    age_cat        = factor(age_cat)        %>% forcats::fct_drop(),
-    sex            = factor(sex)            %>% forcats::fct_drop(),
-    race_eth       = factor(race_eth)       %>% forcats::fct_drop(),
-    ed_cat         = factor(ed_cat)         %>% forcats::fct_drop(),
-    indfmpir_cat   = factor(indfmpir_cat)   %>% forcats::fct_drop(),
+    age_cat        = mk_age_cat(ridageyr) %>% forcats::fct_drop(),
+    sex            = factor(sex) %>% forcats::fct_drop(),
+    race_eth       = factor(race_eth) %>% forcats::fct_drop(),
+    ed_cat         = factor(ed_cat) %>% forcats::fct_drop(),
+    indfmpir_cat   = mk_indfmpir_cat(indfmpir) %>% forcats::fct_drop(),
     insured        = factor(insured, levels = c("No","Yes")) %>% forcats::fct_drop(),
-    visits_cat     = factor(visits_cat)     %>% forcats::fct_drop(),
-    hosp_stays_cat = factor(hosp_stays_cat) %>% forcats::fct_drop()
+    visits_cat     = factor(visits_cat) %>% forcats::fct_drop(),
+    hosp_stays_cat = factor(hosp_stays_cat) %>% forcats::fct_drop(),
+    comorbidity_n  = as.numeric(comorbidity_n),
+    cci_score      = as.numeric(cci_score)
   )
 
-# Dummy outcome: VIF uses only the X matrix; outcome choice doesn't matter
+# Create a dummy outcome for VIF calculation (VIF uses only the predictor matrix)
 set.seed(604)
 y_dummy <- rnorm(nrow(d1))
 
-# Auxiliary weighted linear model with the EXACT SAME RHS as the full Cox model
+# Fit auxiliary weighted linear model with the exact same RHS as the full Cox model
 aux_lm <- lm(
   y_dummy ~ poly_cat + age_cat + sex + race_eth + ed_cat + indfmpir_cat +
     insured + comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
@@ -1316,18 +772,18 @@ aux_lm <- lm(
   weights = wtint_pool
 )
 
-# GVIF/GVIF^(1/(2*Df))
+# Calculate GVIF/GVIF^(1/(2*Df))
 gv <- car::vif(aux_lm)
 
 gvif_df <-
   if (is.matrix(gv)) {
-    # multi-df terms present
+    # Multi-df terms present (categorical variables)
     as.data.frame(gv) %>%
       tibble::rownames_to_column("Variable") %>%
       dplyr::rename(GVIF = GVIF, Df = Df) %>%
       dplyr::mutate(`Adj.GVIF` = GVIF^(1/(2*Df)))
   } else {
-    # all 1-df terms
+    # All 1-df terms (continuous variables only)
     tibble::tibble(
       Variable = names(gv),
       GVIF     = as.numeric(gv),
@@ -1347,10 +803,715 @@ gvif_df <-
 knitr::kable(
   gvif_df,
   digits  = 3,
-  caption = "Adjusted GVIFs (imputation #1); auxiliary weighted linear model with full-model predictors"
+  caption = "Variance inflation factors for full Cox model (based on imputation #1)"
 ) %>%
   kableExtra::kable_styling()
 ```
 
-**Interpretation:** GVIF > 5 indicates high multicollinearity. Note that categorical variables (age_cat, race_eth, ed_cat) are reported with degrees of freedom. `GVIF^(1/(2*DF))` is a normalized version comparable to univariate VIF; values > 2.5 warrant attention. Moderate correlations among socioeconomic variables (education, income, insurance) are expected.
+**Interpretation:** We assess multicollinearity using adjusted GVIF values. For categorical predictors, the adjusted GVIF (GVIF^(1/(2×Df))) provides a measure comparable to standard VIF for continuous variables. Values above 5 indicate severe multicollinearity, values between 2.5-5 suggest high multicollinearity, and values between 2-2.5 indicate moderate multicollinearity. Our results show that all adjusted GVIF values are within acceptable ranges (< 5), indicating that multicollinearity is not a substantial concern in our model. Some moderate correlations among socioeconomic variables (education, income, insurance) are expected and do not compromise the validity of our estimates. The model's predictor structure is appropriate for drawing inferences about the association between polypharmacy and mortality.
 
+\newpage
+
+# **Interaction models with therapeutic classes**
+
+To explore whether the association between polypharmacy and mortality differs by type of medication, we fit interaction models between polypharmacy categories and four major therapeutic classes: antineoplastic agents, central nervous system (CNS) medications, cardiovascular drugs, and psychotherapeutic medications. These models exclude individuals taking zero medications (as they cannot have therapeutic class exposures) and use 1-4 medications as the reference group.
+
+```{r interaction-models}
+rx_flags <- c(
+  "rx_antineoplastic",
+  "rx_cns",
+  "rx_cardiovascular",
+  "rx_psychotherapeutic"
+)
+
+# ------------------------------------------------------------
+# helper: tidy MIcombine output → tibble with term column
+# ------------------------------------------------------------
+tidy_from_micombine <- function(mi_obj, exponentiate = TRUE) {
+  sm <- summary(mi_obj, conf.int = TRUE)
+  sm <- tibble::as_tibble(sm, rownames = "term")  # <-- make 'term'
+
+  nm <- names(sm)
+  lower_name <- nm[grepl("lower", nm, fixed = TRUE)]
+  upper_name <- nm[grepl("upper", nm, fixed = TRUE)]
+
+  if (length(lower_name) == 1) {
+    sm <- dplyr::rename(sm, conf.low = !!lower_name)
+  }
+  if (length(upper_name) == 1) {
+    sm <- dplyr::rename(sm, conf.high = !!upper_name)
+  }
+
+  sm <- dplyr::rename(sm, estimate = results, std.error = se)
+
+  if (!"p.value" %in% names(sm)) {
+    sm$p.value <- NA_real_
+  }
+
+  if (exponentiate) {
+    sm <- sm %>%
+      dplyr::mutate(
+        estimate = exp(estimate),
+        conf.low = exp(conf.low),
+        conf.high = exp(conf.high)
+      )
+  }
+
+  sm %>%
+    dplyr::mutate(statistic = NA_real_) %>%
+    dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high, p.value)
+}
+
+# ------------------------------------------------------------
+# fit interaction model for ONE class, excluding poly_cat == "0"
+# ------------------------------------------------------------
+fit_interaction_for_flag <- function(flag, imp_obj) {
+  m <- imp_obj$m
+  fit_list <- vector("list", m)
+  keep     <- rep(FALSE, m)
+
+  for (i in seq_len(m)) {
+    di <- mice::complete(imp_obj, i)
+
+    if (!flag %in% names(di)) {
+      di[[flag]] <- 0L
+    }
+
+    di <- di %>%
+      dplyr::filter(poly_cat != "0") %>%
+      dplyr::mutate(
+        poly_cat     = factor(poly_cat, levels = c("1–4","5–9","≥10")),
+        age_cat      = mk_age_cat(ridageyr),
+        indfmpir_cat = mk_indfmpir_cat(indfmpir),
+        insured      = factor(insured, levels = c("No","Yes")),
+        class_flag_raw = dplyr::coalesce(!!rlang::sym(flag), 0L),
+        class_flag     = factor(ifelse(class_flag_raw == 1, 1, 0), levels = c(0,1)),
+        comorbidity_n  = as.numeric(comorbidity_n),
+        cci_score      = as.numeric(cci_score)
+      ) %>%
+      dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+
+    if (length(unique(di$class_flag)) < 2) {
+      next
+    }
+
+    dd <- svydesign(
+      ids     = ~ sdmvpsu,
+      strata  = ~ sdmvstra,
+      weights = ~ wtint_pool,
+      nest    = TRUE,
+      data    = di
+    )
+
+    fit_i <- try(
+      svycoxph(
+        survival::Surv(time_y, event) ~ poly_cat * class_flag +
+          age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
+          comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+        design = dd
+      ),
+      silent = TRUE
+    )
+
+    if (!inherits(fit_i, "try-error")) {
+      fit_list[[i]] <- fit_i
+      keep[i] <- TRUE
+    }
+  }
+
+  if (!any(keep)) {
+    stop("No usable imputations for ", flag, " (no variation in class_flag).")
+  }
+
+  coefs  <- lapply(fit_list[keep], coef)
+  vcovs  <- lapply(fit_list[keep], vcov)
+  pooled <- mitools::MIcombine(coefs, vcovs)
+
+  list(
+    pooled   = pooled,
+    fits     = fit_list[keep],
+    keep_ids = which(keep)
+  )
+}
+
+# ------------------------------------------------------------
+# interaction measures
+# ------------------------------------------------------------
+interaction_measures_from_pooled <- function(pooled_obj) {
+  beta <- pooled_obj$coefficients
+  V    <- pooled_obj$variance
+
+  get_lhr <- function(term_vec) {
+    b  <- beta[names(term_vec)]
+    lh <- sum(b * term_vec)
+    se <- sqrt(as.numeric(t(term_vec) %*%
+                            V[names(term_vec), names(term_vec), drop = FALSE] %*%
+                            term_vec))
+    c(lhr = lh, se = se)
+  }
+
+  rows <- list()
+  rows[["poly1_4_class0"]] <- c(lhr = 0, se = 0)
+
+  if ("class_flag1" %in% names(beta)) {
+    rows[["poly1_4_class1"]] <- get_lhr(c(class_flag1 = 1))
+  }
+  if ("poly_cat5–9" %in% names(beta)) {
+    rows[["poly5_9_class0"]] <- get_lhr(c(`poly_cat5–9` = 1))
+  }
+  if (all(c("poly_cat5–9","class_flag1","poly_cat5–9:class_flag1") %in% names(beta))) {
+    rows[["poly5_9_class1"]] <- get_lhr(c(
+      `poly_cat5–9` = 1,
+      class_flag1 = 1,
+      `poly_cat5–9:class_flag1` = 1
+    ))
+  }
+  if ("poly_cat≥10" %in% names(beta)) {
+    rows[["poly10p_class0"]] <- get_lhr(c(`poly_cat≥10` = 1))
+  }
+  if (all(c("poly_cat≥10","class_flag1","poly_cat≥10:class_flag1") %in% names(beta))) {
+    rows[["poly10p_class1"]] <- get_lhr(c(
+      `poly_cat≥10` = 1,
+      class_flag1   = 1,
+      `poly_cat≥10:class_flag1` = 1
+    ))
+  }
+
+  combos_df <- purrr::imap_dfr(rows, ~{
+    tibble::tibble(
+      combo = .y,
+      logHR = .x[["lhr"]],
+      se    = .x[["se"]],
+      HR    = exp(.x[["lhr"]]),
+      LCL   = exp(.x[["lhr"]] - 1.96 * .x[["se"]]),
+      UCL   = exp(.x[["lhr"]] + 1.96 * .x[["se"]])
+    )
+  })
+
+  add_mult_59 <- NULL
+  if (all(c("poly5_9_class1","poly5_9_class0","poly1_4_class1") %in% combos_df$combo)) {
+    HR11 <- combos_df$HR[combos_df$combo == "poly5_9_class1"]
+    HR10 <- combos_df$HR[combos_df$combo == "poly5_9_class0"]
+    HR01 <- combos_df$HR[combos_df$combo == "poly1_4_class1"]
+    RERI <- HR11 - HR10 - HR01 + 1
+    mult <- HR11 / (HR10 * HR01)
+    add_mult_59 <- tibble::tibble(
+      band = "5–9",
+      RERI = RERI,
+      mult = mult
+    )
+  }
+
+  add_mult_10p <- NULL
+  if (all(c("poly10p_class1","poly10p_class0","poly1_4_class1") %in% combos_df$combo)) {
+    HR11 <- combos_df$HR[combos_df$combo == "poly10p_class1"]
+    HR10 <- combos_df$HR[combos_df$combo == "poly10p_class0"]
+    HR01 <- combos_df$HR[combos_df$combo == "poly1_4_class1"]
+    RERI <- HR11 - HR10 - HR01 + 1
+    mult <- HR11 / (HR10 * HR01)
+    add_mult_10p <- tibble::tibble(
+      band = "≥10",
+      RERI = RERI,
+      mult = mult
+    )
+  }
+
+  list(
+    combos = combos_df,
+    additive_multiplicative = dplyr::bind_rows(add_mult_59, add_mult_10p)
+  )
+}
+
+# ------------------------------------------------------------
+# run for all 4 therapeutic classes
+# ------------------------------------------------------------
+rx_flags <- c(
+  "rx_antineoplastic",
+  "rx_cns",
+  "rx_cardiovascular",
+  "rx_psychotherapeutic"
+)
+
+int_results <- purrr::map(rx_flags, ~fit_interaction_for_flag(.x, imp))
+names(int_results) <- rx_flags
+
+int_measures <- purrr::imap(int_results, function(obj, flag) {
+  mm <- interaction_measures_from_pooled(obj$pooled)
+  list(flag = flag, combos = mm$combos, im = mm$additive_multiplicative)
+})
+
+# ------------------------------------------------------------
+# gtsummary tables (one per class)
+# ------------------------------------------------------------
+sink(tempfile())
+int_tbls <- purrr::imap(int_results, function(x, flag) {
+  td <- tidy_from_micombine(x$pooled, exponentiate = TRUE)
+  dummy_fit <- x$fits[[1]]
+
+  gtsummary::tbl_regression(
+    x = dummy_fit,
+    exponentiate = TRUE,
+    tidy_fun = function(...) td
+  ) %>%
+    gtsummary::modify_caption(
+      paste0("**Survey-weighted Cox model with polypharmacy × ", flag, " (0-meds excluded)**")
+    ) %>%
+    gtsummary::bold_labels()
+})
+sink()
+
+# print interaction tables
+int_tbls[[1]]
+int_tbls[[2]]
+int_tbls[[3]]
+int_tbls[[4]]
+
+# -------------------------------------------------------------------
+# Collect all combo HRs for plotting
+# -------------------------------------------------------------------
+plot_dat <- purrr::imap_dfr(int_measures, function(obj, flag) {
+  obj$combos %>%
+    dplyr::mutate(flag = flag, .before = 1)
+})
+
+# -------------------------------------------------------------------
+# plot HRs for all combos & classes
+# -------------------------------------------------------------------
+# make nicer labels for the combos
+plot_dat_clean <- plot_dat %>%
+  dplyr::mutate(
+    combo_lbl = dplyr::case_when(
+      combo == "poly1_4_class0"  ~ "1–4 meds, non-user",
+      combo == "poly1_4_class1"  ~ "1–4 meds, user",
+      combo == "poly5_9_class0"  ~ "5–9 meds, non-user",
+      combo == "poly5_9_class1"  ~ "5–9 meds, user",
+      combo == "poly10p_class0"  ~ "≥10 meds, non-user",
+      combo == "poly10p_class1"  ~ "≥10 meds, user",
+      TRUE ~ combo
+    ),
+    # order from lowest exposure to highest, and non-user before user
+    combo_lbl = factor(
+      combo_lbl,
+      levels = c(
+        "1–4 meds, non-user",
+        "1–4 meds, user",
+        "5–9 meds, non-user",
+        "5–9 meds, user",
+        "≥10 meds, non-user",
+        "≥10 meds, user"
+      )
+    )
+  )
+
+ggplot(plot_dat_clean,
+       aes(y = combo_lbl, x = HR, xmin = LCL, xmax = UCL, color = flag)) +
+  geom_pointrange(position = position_dodge(width = 0.6)) +
+  geom_vline(xintercept = 1, linetype = 2, color = "grey40") +
+  scale_x_log10(breaks = c(0.5, 1, 2, 4)) +
+  labs(
+    title = "Hazard ratios for polypharmacy by therapeutic class",
+    subtitle = "Interaction models (0 medications excluded)",
+    x     = "Hazard ratio (log scale)",
+    y     = "",
+    color = "Therapeutic class"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+\newpage
+
+# **Spline sensitivity: continuous medication count**
+
+To assess whether the categorical groupings (0, 1-4, 5-9, ≥10) adequately capture the dose-response relationship, we fit a model using a restricted cubic spline for continuous medication count. This flexible approach allows us to visualize potential non-linear associations without imposing arbitrary cut-points. We use a natural spline with 2 degrees of freedom (equivalent to 3 knots), which provides flexibility while avoiding overfitting.
+
+```{r spline-analysis}
+# Fit spline model (relative to 0 medications)
+fit_spline <- with(imp, {
+  di <- tibble(
+    sdmvpsu, sdmvstra, wtint_pool, time_y, event,
+    rxdcount_cont = as.numeric(rxdcount),
+    age_cat       = mk_age_cat(ridageyr),
+    sex, race_eth, ed_cat,
+    insured       = factor(insured, levels = c("No","Yes")),
+    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
+    comorbidity_n = as.numeric(comorbidity_n),
+    cci_score     = as.numeric(cci_score),
+    visits_cat, hosp_stays_cat
+  ) %>%
+    mutate(across(where(is.factor), fct_drop))
+
+  dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                  nest = TRUE, data = di)
+
+  svycoxph(
+    Surv(time_y, event) ~ ns(rxdcount_cont, df = 2) +
+      age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
+      comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
+    design = dd
+  )
+})
+
+sink(tempfile())
+# Pool results
+po <- mice::pool(fit_spline)
+
+sink()
+
+pooled_summary <- summary(po, conf.int = TRUE)
+
+# Extract coefficients for the spline terms
+spline_coefs <- pooled_summary %>%
+  filter(grepl("^ns\\(rxdcount_cont", term))
+
+# Check if we have spline terms
+if (nrow(spline_coefs) > 0) {
+  
+  # Generate prediction grid
+  rx_seq <- seq(0, 20, by = 0.5)
+  
+  # Get data from first imputation to establish knot structure
+  d1_spline <- mice::complete(imp, 1) %>%
+    mutate(rxdcount_cont = as.numeric(rxdcount))
+  
+  # Fit a reference spline to get knot attributes
+  ref_spline <- ns(d1_spline$rxdcount_cont, df = 2)
+  knots_attr <- attr(ref_spline, "knots")
+  boundary_attr <- attr(ref_spline, "Boundary.knots")
+  
+  # Generate spline basis for prediction grid using same knots
+  basis_pred <- ns(rx_seq, knots = knots_attr, Boundary.knots = boundary_attr)
+  
+  # Extract spline coefficient vector
+  spline_beta <- spline_coefs$estimate
+  
+  # Get the variance-covariance matrix from the pooled object
+  # The pooled vcov matrix is stored in po$pooled$t
+  # We need to extract just the spline term variances
+  spline_term_names <- spline_coefs$term
+  all_term_names <- pooled_summary$term
+  spline_indices <- which(all_term_names %in% spline_term_names)
+  
+  # Extract standard errors for spline terms
+  spline_se <- spline_coefs$std.error
+  
+  # Create a diagonal variance matrix (simplified approach)
+  # This is conservative as it ignores covariances between spline terms
+  vcov_spline_diag <- diag(spline_se^2)
+  
+  # Compute linear predictor for spline terms (relative to rxdcount = 0)
+  lp <- as.vector(basis_pred %*% spline_beta)
+  
+  # Compute standard errors (using diagonal variance matrix)
+  # This is a conservative estimate
+  se_lp <- sqrt(diag(basis_pred %*% vcov_spline_diag %*% t(basis_pred)))
+  
+  # Create HR curve data
+  hr_curve <- tibble(
+    rxdcount = rx_seq,
+    HR       = exp(lp),
+    LCL      = exp(lp - 1.96 * se_lp),
+    UCL      = exp(lp + 1.96 * se_lp)
+  )
+  
+  # Plot
+  ggplot(hr_curve, aes(x = rxdcount, y = HR)) +
+    geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.2, fill = "steelblue") +
+    geom_line(color = "steelblue", linewidth = 1) +
+    geom_hline(yintercept = 1, linetype = 2, color = "gray40") +
+    scale_y_log10() +
+    coord_cartesian(xlim = c(0, 15)) +
+    labs(
+      title = "Dose-response relationship: medication count and mortality",
+      subtitle = "Natural spline model (df=2, relative to 0 medications)",
+      x = "Number of medications",
+      y = "Hazard ratio (log scale)"
+    ) +
+    theme_minimal(base_size = 12)
+  
+} else {
+  cat("Note: Spline terms not found in model output. Skipping spline plot.\n")
+}
+```
+
+**Interpretation:** The spline model reveals the shape of the dose-response relationship between medication count and mortality risk. We observe whether the association is approximately linear or exhibits threshold effects or plateaus. This visualization helps validate our categorical groupings and provides insight into whether particular medication counts correspond to inflection points in mortality risk. The shaded region represents the 95% confidence interval, with wider intervals at the extremes reflecting fewer observations. Note that confidence intervals use a conservative approach that ignores covariances between spline terms, so actual intervals may be slightly narrower.
+
+\newpage
+
+# **Sensitivity: restrict to higher multimorbidity thresholds**
+
+To address potential confounding by indication, we conduct sensitivity analyses restricting the sample to individuals with at least 2, 3, 4, or 5 chronic conditions. This approach helps isolate the effect of polypharmacy from underlying disease burden, as individuals with more comorbidities have more legitimate clinical reasons for taking multiple medications. If the polypharmacy-mortality association persists or strengthens in these restricted samples, it suggests the relationship is not solely due to confounding by indication.
+
+```{r multimorbidity, fig.width=7, fig.height=5}
+cutpoints <- c(2,3,4,5)
+
+tidy_poly <- function(mira_obj, model_name) {
+  po <- mice::pool(mira_obj)
+  sm <- summary(po, conf.int = TRUE)
+  sm %>%
+    dplyr::filter(grepl("^poly_cat", term)) %>%
+    dplyr::transmute(
+      model = model_name,
+      term,
+      HR   = exp(estimate),
+      LCL  = exp(`2.5 %`),
+      UCL  = exp(`97.5 %`)
+    )
+}
+
+fit_mm <- lapply(cutpoints, function(k) {
+  with(imp, {
+    di <- tibble(
+      sdmvpsu, sdmvstra, wtint_pool, time_y, event, ridageyr,
+      poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+      age_cat  = mk_age_cat(ridageyr),
+      sex, race_eth, ed_cat,
+      insured = factor(insured, levels = c("No","Yes")),
+      indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
+      comorbidity_n = as.numeric(comorbidity_n),
+      cci_score     = as.numeric(cci_score),
+      visits_cat, hosp_stays_cat
+    ) %>%
+      dplyr::filter(comorbidity_n >= k) %>%
+      dplyr::mutate(dplyr::across(where(is.factor), forcats::fct_drop))
+
+    dd <- svydesign(
+      ids     = ~ sdmvpsu,
+      strata  = ~ sdmvstra,
+      weights = ~ wtint_pool,
+      nest    = TRUE,
+      data    = di
+    )
+
+    svycoxph(
+      Surv(time_y, event) ~ poly_cat + age_cat + sex + race_eth +
+        ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+        visits_cat + hosp_stays_cat,
+      design = dd
+    )
+  })
+})
+
+sink(tempfile())
+
+mm_pooled <- purrr::map2_dfr(fit_mm, cutpoints, function(mira_obj, k) {
+  tidy_poly(mira_obj, paste0("Comorbidity ≥ ", k))
+})
+
+sink()
+
+y_order <- unique(mm_pooled$model)
+
+mm_plot <- mm_pooled %>%
+    mutate(
+        exposure_lbl = case_when(
+            term == "poly_cat5–9"  ~ "5–9 medications",
+            term == "poly_cat≥10"  ~ "≥10 medications",
+            term == "poly_cat1–4"  ~ "1–4 medications (ref)",
+            term == "poly_cat0"    ~ "0 medications",
+            TRUE                   ~ term
+        ),
+        .keep = "all"
+    ) %>%
+    filter(exposure_lbl != "1–4 medications (ref)") %>%
+    mutate(
+        model = fct_rev(fct_inorder(model)),
+        exposure_lbl = factor(exposure_lbl,
+                              levels = c("0 medications", "5–9 medications", "≥10 medications"))
+    )
+
+ggplot(mm_plot,
+       aes(x = HR, y = model,
+           xmin = LCL, xmax = UCL,
+           color = exposure_lbl)) +
+    geom_pointrange(position = position_dodge2(width = 0.6)) +
+    geom_vline(xintercept = 1, linetype = 2, color = "gray50") +
+    scale_x_log10() +
+    scale_y_discrete(limits = y_order) +
+    labs(
+        title = "Polypharmacy HRs across increasing multimorbidity restrictions",
+        x     = "Hazard ratio",
+        y     = "",
+        color = "Medication category"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+        legend.position = "right"
+    )
+```
+
+**Interpretation:** We examine how the polypharmacy-mortality association changes when we progressively restrict the sample to individuals with higher comorbidity burdens. If hazard ratios remain elevated or increase in magnitude, this suggests that polypharmacy confers mortality risk beyond what is explained by the underlying conditions requiring treatment. Conversely, if associations attenuate substantially, this would suggest that much of the observed risk is attributable to confounding by indication rather than medication burden per se.
+
+\newpage
+
+# **Sensitivity: censor follow-up at 5 and 10 years**
+
+We conduct sensitivity analyses censoring follow-up at 5 and 10 years to assess whether the polypharmacy-mortality association differs by duration of follow-up. Shorter follow-up windows may better capture acute medication-related risks, while longer follow-up may be more affected by changes in medication use over time (not captured by our baseline measurement). These analyses also reduce the potential for exposure misclassification that increases with time since baseline.
+
+```{r censor-5}
+
+fit_5yr <- with(imp, {
+  di <- tibble(
+    sdmvpsu, sdmvstra, wtint_pool, time_y, event, ridageyr,
+    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+    age_cat  = mk_age_cat(ridageyr),
+    sex, race_eth, ed_cat,
+    insured = factor(insured, levels = c("No","Yes")),
+    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
+    comorbidity_n = as.numeric(comorbidity_n),
+    cci_score     = as.numeric(cci_score),
+    visits_cat, hosp_stays_cat
+  ) %>%
+    mutate(
+      time_y_5 = pmin(time_y, 5),
+      event_5  = ifelse(time_y <= 5 & event == 1, 1, 0)
+    ) %>%
+    mutate(across(where(is.factor), fct_drop))
+
+  dd <- svydesign(
+    ids     = ~ sdmvpsu,
+    strata  = ~ sdmvstra,
+    weights = ~ wtint_pool,
+    nest    = TRUE,
+    data    = di
+  )
+
+  svycoxph(
+    Surv(time_y_5, event_5) ~ poly_cat + age_cat + sex + race_eth +
+      ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+      visits_cat + hosp_stays_cat,
+    design = dd
+  )
+})
+```
+
+```{r censor-10}
+fit_10yr <- with(imp, {
+  di <- tibble(
+    sdmvpsu, sdmvstra, wtint_pool, time_y, event, ridageyr,
+    poly_cat = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+    age_cat  = mk_age_cat(ridageyr),
+    sex, race_eth, ed_cat,
+    insured = factor(insured, levels = c("No","Yes")),
+    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
+    comorbidity_n = as.numeric(comorbidity_n),
+    cci_score     = as.numeric(cci_score),
+    visits_cat, hosp_stays_cat
+  ) %>%
+    mutate(
+      time_y_10 = pmin(time_y, 10),
+      event_10  = ifelse(time_y <= 10 & event == 1, 1, 0)
+    ) %>%
+    mutate(across(where(is.factor), fct_drop))
+
+  dd <- svydesign(
+    ids     = ~ sdmvpsu,
+    strata  = ~ sdmvstra,
+    weights = ~ wtint_pool,
+    nest    = TRUE,
+    data    = di
+  )
+
+  svycoxph(
+    Surv(time_y_10, event_10) ~ poly_cat + age_cat + sex + race_eth +
+      ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+      visits_cat + hosp_stays_cat,
+    design = dd
+  )
+})
+```
+
+\newpage
+
+# **Grand forest plot (main + censoring + multimorbidity)**
+
+We synthesize results from all model specifications in a comprehensive forest plot. This visualization allows us to assess the robustness of our findings across different modeling approaches (crude, basic, full adjustment), sensitivity analyses (censored follow-up at 5 and 10 years), and subgroup analyses (restricted to individuals with increasing comorbidity burdens). Consistent patterns across specifications strengthen causal inference, while meaningful differences may reveal important effect modification or confounding structures.
+
+```{r grand-forest, fig.width=9, fig.height=5}
+tidy_poly_model <- function(mira_obj, model_name) {
+    po <- mice::pool(mira_obj)
+    sm <- summary(po, conf.int = TRUE)
+    sm %>%
+        dplyr::filter(grepl("^poly_cat", term)) %>%
+        dplyr::transmute(
+            model = model_name,
+            term,
+            HR   = exp(estimate),
+            LCL  = exp(`2.5 %`),
+            UCL  = exp(`97.5 %`)
+        )
+}
+
+sink(tempfile())
+
+df_crude <- tidy_poly_model(fit_crude, "Crude")
+df_basic <- tidy_poly_model(fit_basic, "Basic")
+df_full  <- tidy_poly_model(fit_full,  "Full")
+df_5     <- tidy_poly_model(fit_5yr,   "5-year censor")
+df_10    <- tidy_poly_model(fit_10yr,  "10-year censor")
+
+sink()
+# mm_pooled should already be a df with columns model, term, HR, LCL, UCL
+# we'll assume you named its model column "Multimorbidity" earlier; if not, do:
+# mm_pooled <- mm_pooled %>% mutate(model = "Multimorbidity")
+
+grand_df <- bind_rows(
+    df_crude,
+    df_basic,
+    df_full,
+    mm_pooled,
+    df_5,
+    df_10
+) %>%
+    # make exposure labels readable
+    mutate(
+        exposure_lbl = case_when(
+            term == "poly_cat0"    ~ "0 medications",
+            term == "poly_cat1–4"  ~ "1–4 medications (ref)",
+            term == "poly_cat5–9"  ~ "5–9 medications",
+            term == "poly_cat≥10"  ~ "≥10 medications",
+            TRUE                   ~ term
+        )
+    ) %>%
+    # usually we don't want to plot the reference
+    filter(exposure_lbl != "1–4 medications (ref)")
+
+# enforce y-axis order (bottom -> top)
+model_order <- c(
+    "Crude",
+    "Basic",
+    "Full",
+    "Comorbidity ≥ 2",
+    "Comorbidity ≥ 3",
+    "Comorbidity ≥ 4",
+    "Comorbidity ≥ 5",
+    "5-year censor",
+    "10-year censor"
+)
+
+grand_df <- grand_df %>%
+    mutate(
+        model = factor(model, levels = model_order),
+        exposure_lbl = factor(exposure_lbl,
+                              levels = c("0 medications", "5–9 medications", "≥10 medications"))
+    )
+
+ggplot(
+    grand_df,
+    aes(y = model, x = HR, xmin = LCL, xmax = UCL, color = exposure_lbl)
+) +
+    geom_pointrange(position = position_dodge2(width = 0.6)) +
+    geom_vline(xintercept = 1, linetype = 2, color = "gray50") +
+    scale_x_log10(breaks = c(0.6, 0.8, 1, 1.5, 2, 3)) +
+    labs(
+        title = "Hazard ratios for polypharmacy across model specifications",
+        x     = "Hazard ratio (log scale)",
+        y     = "",
+        color = "Medication category"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+        legend.position = "right"
+    )
+
+```
