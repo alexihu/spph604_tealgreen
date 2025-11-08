@@ -110,7 +110,7 @@ analytic_raw <- readRDS("data/analytic_raw.rds")
 
 # 2) Create pooled interview weight over 8 cycles
 analytic_raw <- analytic_raw %>%
-  mutate(wtint_pool = wtint2yr / 8)
+    mutate(wtint_pool = wtint2yr / 8)
 
 # 3) Set up survey design on the full dataset
 dsgn_all <- svydesign(
@@ -126,7 +126,8 @@ dsgn_elig <- subset(
   dsgn_all,
   !is.na(ridageyr) & ridageyr >= 45 &
     !is.na(time_y) &
-    event %in% c(0, 1)
+    event %in% c(0, 1) &
+     !ucod_leading %in% c(4, 10)
 )
 
 # 5) Add model-ready variables to the survey design
@@ -482,7 +483,6 @@ knitr::kable(
 
 # Display results for INSURED missingness model
 ins_miss_tbl <- broom::tidy(fit_miss_ins, exponentiate = TRUE, conf.int = TRUE) %>%
-  dplyr::mutate(dplyr::across(where(is.numeric), ~round(., 3))) %>%
   dplyr::select(term, estimate, conf.low, conf.high, p.value)
 
 knitr::kable(
@@ -596,8 +596,8 @@ imp <- mice(
   printFlag = FALSE  # Suppress iteration messages
 )
 
-# Quick visual check of convergence (suppressing plot messages)
-invisible(plot(imp, c("indfmpir","insured")))
+# Quick visual check of convergence
+plot(imp, c("indfmpir","insured"))
 ```
 
 \newpage
@@ -1117,124 +1117,160 @@ ggplot(plot_dat_clean,
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
+
+# RERI / multiplicative table
+#--------------------------------------------------
+reri_tbl <- purrr::imap_dfr(int_measures, ~{
+    if (is.null(.x$im) || nrow(.x$im) == 0) return(NULL)
+    .x$im %>% dplyr::mutate(flag = .y, .before = 1)
+})
+
+reri_tbl
 ```
 
 \newpage
 
-# **Spline sensitivity: continuous medication count**
+# **Sensitivity: continuous medication count with spline**
 
 To assess whether the categorical groupings (0, 1-4, 5-9, ≥10) adequately capture the dose-response relationship, we fit a model using a restricted cubic spline for continuous medication count. This flexible approach allows us to visualize potential non-linear associations without imposing arbitrary cut-points. We use a natural spline with 2 degrees of freedom (equivalent to 3 knots), which provides flexibility while avoiding overfitting.
 
 ```{r spline-analysis}
-# Fit spline model (relative to 0 medications)
-fit_spline <- with(imp, {
-  di <- tibble(
-    sdmvpsu, sdmvstra, wtint_pool, time_y, event,
-    rxdcount_cont = as.numeric(rxdcount),
-    age_cat       = mk_age_cat(ridageyr),
-    sex, race_eth, ed_cat,
-    insured       = factor(insured, levels = c("No","Yes")),
-    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
-    comorbidity_n = as.numeric(comorbidity_n),
-    cci_score     = as.numeric(cci_score),
-    visits_cat, hosp_stays_cat
-  ) %>%
-    mutate(across(where(is.factor), fct_drop))
+# -------------------------------------------------------------------------
+# 1. turn each imputed dataset into a survey design  ==> design_list
+#    assumes you already have `imp` (class mids) from mice()
+# -------------------------------------------------------------------------
+comp_list <- lapply(seq_len(imp$m), function(i) {
+  di <- mice::complete(imp, i)
 
-  dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
-                  nest = TRUE, data = di)
+  di %>%
+    dplyr::mutate(
+      age_cat       = mk_age_cat(ridageyr),
+      indfmpir_cat  = mk_indfmpir_cat(indfmpir),
+      insured       = factor(insured, levels = c("No","Yes")),
+      poly_cat      = factor(poly_cat, levels = c("1–4","0","5–9","≥10")),
+      comorbidity_n = as.numeric(comorbidity_n),
+      cci_score     = as.numeric(cci_score)
+    )
+})
+
+design_list <- lapply(comp_list, function(di) {
+  svydesign(
+    ids     = ~ sdmvpsu,
+    strata  = ~ sdmvstra,
+    weights = ~ wtint_pool,
+    nest    = TRUE,
+    data    = di
+  )
+})
+
+# -------------------------------------------------------------------------
+# 2. fit the spline model on EACH design
+# -------------------------------------------------------------------------
+fit_list <- lapply(design_list, function(dd) {
+  # make sure insured is 2-level factor in the design
+  dd <- update(dd, insured = factor(insured, levels = c("No", "Yes")))
 
   svycoxph(
-    Surv(time_y, event) ~ ns(rxdcount_cont, df = 2) +
+    survival::Surv(time_y, event) ~ splines::ns(rxdcount, knots = c(5, 10)) +
       age_cat + sex + race_eth + ed_cat + indfmpir_cat + insured +
       comorbidity_n + cci_score + visits_cat + hosp_stays_cat,
     design = dd
   )
 })
 
-sink(tempfile())
-# Pool results
-po <- mice::pool(fit_spline)
+# -------------------------------------------------------------------------
+# 3. pool spline coefficients (mitools) and build prediction grid
+# -------------------------------------------------------------------------
+coefs <- lapply(fit_list, coef)
+vcovs <- lapply(fit_list, vcov)
+mi_pool <- mitools::MIcombine(coefs, vcovs)
+beta    <- mi_pool$coefficients
+V       <- mi_pool$variance
+coef_nm <- names(beta)
 
-sink()
+# use the first design as reference for factor levels
+d1  <- design_list[[1]]
+dat1 <- d1$variables
 
-pooled_summary <- summary(po, conf.int = TRUE)
-
-# Extract coefficients for the spline terms
-spline_coefs <- pooled_summary %>%
-  filter(grepl("^ns\\(rxdcount_cont", term))
-
-# Check if we have spline terms
-if (nrow(spline_coefs) > 0) {
-  
-  # Generate prediction grid
-  rx_seq <- seq(0, 20, by = 0.5)
-  
-  # Get data from first imputation to establish knot structure
-  d1_spline <- mice::complete(imp, 1) %>%
-    mutate(rxdcount_cont = as.numeric(rxdcount))
-  
-  # Fit a reference spline to get knot attributes
-  ref_spline <- ns(d1_spline$rxdcount_cont, df = 2)
-  knots_attr <- attr(ref_spline, "knots")
-  boundary_attr <- attr(ref_spline, "Boundary.knots")
-  
-  # Generate spline basis for prediction grid using same knots
-  basis_pred <- ns(rx_seq, knots = knots_attr, Boundary.knots = boundary_attr)
-  
-  # Extract spline coefficient vector
-  spline_beta <- spline_coefs$estimate
-  
-  # Get the variance-covariance matrix from the pooled object
-  # The pooled vcov matrix is stored in po$pooled$t
-  # We need to extract just the spline term variances
-  spline_term_names <- spline_coefs$term
-  all_term_names <- pooled_summary$term
-  spline_indices <- which(all_term_names %in% spline_term_names)
-  
-  # Extract standard errors for spline terms
-  spline_se <- spline_coefs$std.error
-  
-  # Create a diagonal variance matrix (simplified approach)
-  # This is conservative as it ignores covariances between spline terms
-  vcov_spline_diag <- diag(spline_se^2)
-  
-  # Compute linear predictor for spline terms (relative to rxdcount = 0)
-  lp <- as.vector(basis_pred %*% spline_beta)
-  
-  # Compute standard errors (using diagonal variance matrix)
-  # This is a conservative estimate
-  se_lp <- sqrt(diag(basis_pred %*% vcov_spline_diag %*% t(basis_pred)))
-  
-  # Create HR curve data
-  hr_curve <- tibble(
-    rxdcount = rx_seq,
-    HR       = exp(lp),
-    LCL      = exp(lp - 1.96 * se_lp),
-    UCL      = exp(lp + 1.96 * se_lp)
-  )
-  
-  # Plot
-  ggplot(hr_curve, aes(x = rxdcount, y = HR)) +
-    geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.2, fill = "steelblue") +
-    geom_line(color = "steelblue", linewidth = 1) +
-    geom_hline(yintercept = 1, linetype = 2, color = "gray40") +
-    scale_y_log10() +
-    coord_cartesian(xlim = c(0, 15)) +
-    labs(
-      title = "Dose-response relationship: medication count and mortality",
-      subtitle = "Natural spline model (df=2, relative to 0 medications)",
-      x = "Number of medications",
-      y = "Hazard ratio (log scale)"
-    ) +
-    theme_minimal(base_size = 12)
-  
-} else {
-  cat("Note: Spline terms not found in model output. Skipping spline plot.\n")
+# survey-based reference profile
+svy_median <- function(des, var) {
+  q <- svyquantile(as.formula(paste0("~", var)), des,
+                           quantiles = 0.5, na.rm = TRUE, ci = FALSE)
+  as.numeric(coef(q))
 }
+svy_mode <- function(des, var) {
+  tb <- svytable(as.formula(paste0("~", var)), des)
+  nm <- names(tb); nm[which.max(as.numeric(tb))]
+}
+
+ref_age_cat_val    <- svy_mode(d1, "age_cat")
+ref_sex_val        <- svy_mode(d1, "sex")
+ref_race_val       <- svy_mode(d1, "race_eth")
+ref_ed_val         <- svy_mode(d1, "ed_cat")
+ref_pir_val        <- svy_mode(d1, "indfmpir_cat")
+ref_ins_val        <- svy_mode(d1, "insured")
+ref_visits_val     <- svy_mode(d1, "visits_cat")
+ref_hosp_val       <- svy_mode(d1, "hosp_stays_cat")
+ref_comorb         <- svy_median(d1, "comorbidity_n")
+ref_cci            <- svy_median(d1, "cci_score")
+
+pred_base <- tibble::tibble(
+  rxdcount      = 0,
+  age_cat       = factor(ref_age_cat_val,   levels = levels(dat1$age_cat)),
+  sex           = factor(ref_sex_val,       levels = levels(dat1$sex)),
+  race_eth      = factor(ref_race_val,      levels = levels(dat1$race_eth)),
+  ed_cat        = factor(ref_ed_val,        levels = levels(dat1$ed_cat)),
+  indfmpir_cat  = factor(ref_pir_val,       levels = levels(dat1$indfmpir_cat)),
+  insured       = factor(ref_ins_val,       levels = levels(dat1$insured)),
+  comorbidity_n = ref_comorb,
+  cci_score     = ref_cci,
+  visits_cat    = factor(ref_visits_val,    levels = levels(dat1$visits_cat)),
+  hosp_stays_cat= factor(ref_hosp_val,      levels = levels(dat1$hosp_stays_cat))
+)
+
+pred_grid <- pred_base %>%
+  dplyr::slice(rep(1, 26)) %>%
+  dplyr::mutate(rxdcount = 0:25)
+
+TT_full <- terms(fit_list[[1]])
+TT_noy  <- delete.response(TT_full)
+
+mf_grid <- model.frame(TT_noy, data = pred_grid,
+                       xlev = fit_list[[1]]$xlevels,
+                       na.action = na.pass)
+
+X <- model.matrix(TT_noy, mf_grid)
+X <- X[, coef_nm, drop = FALSE]
+
+# HRs relative to 0 meds
+X_ref <- X[1, , drop = FALSE]
+Delta <- X - matrix(X_ref, nrow = nrow(X), ncol = ncol(X), byrow = TRUE)
+lp    <- as.vector(Delta %*% beta)
+se_lp <- sqrt(pmax(0, rowSums((Delta %*% V) * Delta)))
+
+pred_df <- pred_grid %>%
+  dplyr::mutate(
+    HR  = exp(lp),
+    LCL = exp(lp - 1.96 * se_lp),
+    UCL = exp(lp + 1.96 * se_lp)
+  )
+
+ggplot2::ggplot(pred_df, aes(x = rxdcount, y = HR)) +
+  ggplot2::geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.2) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_hline(yintercept = 1, linetype = 2, color = "grey50") +
+  ggplot2::scale_y_continuous(trans = "log10",
+                              breaks = c(0.5, 1, 2, 3, 5, 10)) +
+  ggplot2::labs(
+    title = "Adjusted HR vs medication count (MI pooled spline)",
+    subtitle = "Natural cubic spline, knots at 5 and 10",
+    x = "Medication count",
+    y = "Hazard Ratio (log scale)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(panel.grid.minor = element_blank())
 ```
 
-**Interpretation:** The spline model reveals the shape of the dose-response relationship between medication count and mortality risk. We observe whether the association is approximately linear or exhibits threshold effects or plateaus. This visualization helps validate our categorical groupings and provides insight into whether particular medication counts correspond to inflection points in mortality risk. The shaded region represents the 95% confidence interval, with wider intervals at the extremes reflecting fewer observations. Note that confidence intervals use a conservative approach that ignores covariances between spline terms, so actual intervals may be slightly narrower.
 
 \newpage
 
