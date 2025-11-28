@@ -537,6 +537,7 @@ mi_dat <- elig_df %>%
     time_y, event, na_cumhaz,          # survival info
     rxdcount,
     poly_cat,
+    poly_cat_no_abx,
     ridageyr,
     age_cat,
     sex,
@@ -1459,6 +1460,39 @@ fit_10yr <- with(imp, {
 
 \newpage
 
+# **Sensitivity: remove anti-biotics from the prescription medication count**
+
+We conduct sensitivity analyses taking anti-biotics out of the prescription medication count. This involves manually counting the number of prescription medications, rather than using the supplied number of medications provided in the data. The rationale for removing anti-biotics is that these are used in the short-term. It does not necessarily reflect chronic or persistent medication burden, and may be slightly different from the "other" prescription medications included in the count. 
+
+```{r exclude antibiotics from med count}
+
+fit_noabx <- with(imp, {
+  di <- tibble(
+    sdmvpsu, sdmvstra, wtint_pool, time_y, event,
+    poly_cat_no_abx = factor(poly_cat_no_abx, levels = c("1–4","0","5–9","≥10")),
+    age_cat  = mk_age_cat(ridageyr),
+    sex, race_eth, ed_cat,
+    insured  = factor(insured, levels = c("No","Yes")),
+    indfmpir, indfmpir_cat = mk_indfmpir_cat(indfmpir),
+    comorbidity_n = as.numeric(comorbidity_n),
+    cci_score     = as.numeric(cci_score),
+    visits_cat, hosp_stays_cat
+  ) %>%
+    mutate(across(where(is.factor), fct_drop))
+  dd <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wtint_pool,
+                  nest = TRUE, data = di)
+  svycoxph(
+    Surv(time_y, event) ~ poly_cat_no_abx + age_cat + sex + race_eth +
+      ed_cat + indfmpir_cat + insured + comorbidity_n + cci_score +
+      visits_cat + hosp_stays_cat,
+    design = dd
+  )
+})
+
+```
+
+\newpage
+
 # **Grand forest plot (main + censoring + multimorbidity)**
 
 We synthesize results from all model specifications in a comprehensive forest plot. This visualization allows us to assess the robustness of our findings across different modeling approaches (crude, basic, full adjustment), sensitivity analyses (censored follow-up at 5 and 10 years), and subgroup analyses (restricted to individuals with increasing comorbidity burdens). Consistent patterns across specifications strengthen causal inference, while meaningful differences may reveal important effect modification or confounding structures.
@@ -1485,6 +1519,7 @@ df_basic <- tidy_poly_model(fit_basic, "Basic")
 df_full  <- tidy_poly_model(fit_full,  "Full")
 df_5     <- tidy_poly_model(fit_5yr,   "5-year censor")
 df_10    <- tidy_poly_model(fit_10yr,  "10-year censor")
+df_noabx <- tidy_poly_model(fit_noabx,  "No antibiotics")
 
 sink()
 # mm_pooled should already be a df with columns model, term, HR, LCL, UCL
@@ -1497,7 +1532,8 @@ grand_df <- bind_rows(
     df_full,
     mm_pooled,
     df_5,
-    df_10
+    df_10,
+    df_noabx
 ) %>%
     # make exposure labels readable
     mutate(
@@ -1506,6 +1542,10 @@ grand_df <- bind_rows(
             term == "poly_cat1–4"  ~ "1–4 medications (ref)",
             term == "poly_cat5–9"  ~ "5–9 medications",
             term == "poly_cat≥10"  ~ "≥10 medications",
+            term == "poly_cat_no_abx0"    ~ "0 medications",
+            term == "poly_cat_no_abx1–4"  ~ "1–4 medications (ref)",
+            term == "poly_cat_no_abx5–9"  ~ "5–9 medications",
+            term == "poly_cat_no_abx≥10"  ~ "≥10 medications",
             TRUE                   ~ term
         )
     ) %>%
@@ -1522,7 +1562,8 @@ model_order <- c(
     "Comorbidity ≥ 4",
     "Comorbidity ≥ 5",
     "5-year censor",
-    "10-year censor"
+    "10-year censor",
+    "No antibiotics"
 )
 
 grand_df <- grand_df %>%
