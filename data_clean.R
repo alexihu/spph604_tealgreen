@@ -311,7 +311,45 @@ rx_all <- rx_all %>%
       ~ if_else(rxdcount == 0, 0L, .x)
     )
   )
+  
+# Create a prescription medication count that discounts anti-biotics
+# List of anti-biotics to exclude were extracted from a supplementary table 1 in https://doi.org/10.1093/ofid/ofab224
+antibiotics_exclude = c(
+  "d00014", "d00069", "d00087", "d00312", "d00053", "d00080", "d00096", 
+  "d00056", "d00073", "d00081", "d00105", "d00052", "d00072", "d00074", 
+  "d00095", "d03874", "d04256", "d04767", "d00125", "d04272", "d05399", 
+  "d00043", "d00279", "d04933", "d00046", "d00091", "d00097", "d03844", 
+  "d03509", "d00025", "d00344", "d01115", "d01120", "d05294", "d00124", 
+  "c00001", "d03165", "d00003", "d00088", "h00006", "d00116", "d07730", 
+  "d00115", "d00152", "d00153", "d00089", "d00011", "d00113", "d00114", 
+  "d04109", "d04500", "d04504", "d04859", "a55548", "a55570", "d00119", 
+  "d00120", "d01090", "d03511", "d00041", "d00110", "d01068", "c00017", 
+  "d00106", "d00112", "d00123", "d03513", "d03618", "d07726", "d08274"
+)
 
+rx_no_abx <- purrr::map_dfr(cycle_meta$suffix, function(suf) {
+  tbl <- paste0("RXQ_RX", suf)
+  df <- tryCatch(suppressWarnings(nhanesA::nhanes(tbl)), error = function(e) NULL)
+  if (is.null(df)) return(tibble())
+  df <- janitor::clean_names(df)
+  df %>%
+    mutate(
+      seqn         = as.integer(seqn),
+      rxduse_n     = suppressWarnings(as.numeric(rxduse)),
+      rxddrgid     = as.character(rxddrgid),
+      rxddrgid_n   = suppressWarnings(as.numeric(rxddrgid)),
+      has_drugcode = !is.na(rxddrgid_n),
+      has_drugname = !is.na(rxddrug) & nzchar(trimws(rxddrug)),
+      med_row      = (rxduse_n == 1) & (has_drugcode | has_drugname),
+      not_antibiotic  = !(rxddrgid %in% antibiotics_exclude)
+        ) %>% 
+    group_by(seqn) %>%
+    summarise(rxdcount_alt_no_abx = sum(med_row & not_antibiotic, na.rm = TRUE), .groups = "drop")
+})
+
+rx_all <- rx_all %>%
+  left_join(rx_no_abx, by = "seqn")
+  
 # Clean up unnecessary RX tables
 rm(rx_info, rx_class_joined, rx_classes_wide,rx_classes_wide_name, rx_class_vars )
 
@@ -628,6 +666,15 @@ analytic_raw <- demo_all %>%
       !is.na(rxdcount) & rxdcount >= 1 & rxdcount <= 4 ~ "1–4",
       !is.na(rxdcount) & rxdcount >= 5 & rxdcount <= 9 ~ "5–9",
       !is.na(rxdcount) & rxdcount >= 10                ~ "≥10",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("0","1–4","5–9","≥10")),
+
+    # Alternative Exposure (polypharmacy categories without antibiotics)
+    poly_cat_no_abx = case_when(
+      !is.na(rxdcount_alt_no_abx) & rxdcount_alt_no_abx == 0                 ~ "0",
+      !is.na(rxdcount_alt_no_abx) & rxdcount_alt_no_abx >= 1 & rxdcount_alt_no_abx <= 4 ~ "1–4",
+      !is.na(rxdcount_alt_no_abx) & rxdcount_alt_no_abx >= 5 & rxdcount_alt_no_abx <= 9 ~ "5–9",
+      !is.na(rxdcount_alt_no_abx) & rxdcount_alt_no_abx >= 10                ~ "≥10",
       TRUE ~ NA_character_
     ) %>% factor(levels = c("0","1–4","5–9","≥10")),
     
