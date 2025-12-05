@@ -358,14 +358,16 @@ gtsummary::tbl_stack(list(tbl_cont_outcome, tbl_cat_outcome)) %>%
   gtsummary::modify_caption("**Descriptive statistics by vital status (observed; missing income/insurance shown as categories)**")
 ```
 
-\\newpage
+\newpage
 
 # Kaplan–Meier curves by polypharmacy + log-rank test
 
 We present weighted Kaplan-Meier survival curves stratified by polypharmacy category to visualize crude survival patterns over follow-up time, accompanied by a risk table showing the unweighted number of participants at risk.
 
-```{r km-curves, fig.width=8, fig.height=8, fig.cap="Kaplan-Meier survival curves by polypharmacy category with risk table"}
-# ---- Survey-weighted Kaplan–Meier by polypharmacy (full time; no SE/CI) -----
+```{r km-curves, fig.width=9, fig.height=8, fig.cap="Kaplan-Meier survival curves by polypharmacy category with risk table"}
+# ---- Survey-weighted Kaplan–Meier by polypharmacy with Aligned Risk Table -----
+
+# 1. Fit the Survey KM
 dd_km <- svydesign(
   ids     = ~ sdmvpsu,
   strata  = ~ sdmvstra,
@@ -376,63 +378,103 @@ dd_km <- svydesign(
 
 km_fit <- svykm(Surv(time_y, event) ~ poly_cat, design = dd_km, se = FALSE, ci = FALSE)
 
+# 2. Extract Data for Plotting (Curve)
 km_df <- purrr::imap_dfr(km_fit, function(fit, grp) {
   tibble(
     time     = fit$time,
     surv     = fit$surv,
-    poly_cat = grp
+    poly_cat_raw = grp
   )
-})
-
-# 1) Main KM Plot
-p_km <- ggplot(km_df, aes(x = time, y = surv, color = poly_cat)) +
-  geom_step(linewidth = 0.9) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-  labs(
-    title = "Survey-weighted Kaplan–Meier survival",
-    x     = "Years since interview",
-    y     = "Survival probability",
-    color = "Medication use"
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.minor = element_blank(),
-    legend.position = "top",
-    axis.title.x = element_blank(), # remove X title to stack with table
-    axis.text.x = element_blank()   # remove X text to stack with table
+}) %>%
+  mutate(
+    # Map raw codes to descriptive labels
+    poly_cat = case_when(
+      poly_cat_raw == "0"   ~ "0 medications",
+      poly_cat_raw == "1–4" ~ "1–4 medications",
+      poly_cat_raw == "5–9" ~ "5–9 medications",
+      poly_cat_raw == "≥10" ~ "≥10 medications",
+      TRUE ~ poly_cat_raw
+    ),
+    # Ensure correct factor ordering
+    poly_cat = factor(poly_cat, levels = c("1–4 medications", "0 medications", "5–9 medications", "≥10 medications"))
   )
 
-# 2) Create Data for Risk Table (Unweighted counts using standard survfit)
-#    Note: Risk tables typically show unweighted N to indicate data sparsity
-risk_times <- c(0, 4, 8, 12, 16)
+# 3. Create Data for Risk Table (Standard Unweighted Counts)
+#    We define specific time breaks for the table
+table_times <- seq(0, 15, by = 3) # 0, 3, 6, 9, 12, 15
+
 fit_unweighted <- survfit(Surv(time_y, event) ~ poly_cat, data = desc_df)
+risk_data <- summary(fit_unweighted, times = table_times, extend = TRUE)
 
-risk_data <- summary(fit_unweighted, times = risk_times, extend = TRUE)
 risk_tbl_df <- tibble(
   time = risk_data$time,
   n.risk = risk_data$n.risk,
   strata = as.character(risk_data$strata)
 ) %>%
   mutate(
-    poly_cat = str_remove(strata, "poly_cat=")
+    # Clean up strata names from "poly_cat=1-4" to just the code
+    poly_cat_raw = str_remove(strata, "poly_cat="),
+    # Map to descriptive labels
+    poly_cat = case_when(
+      poly_cat_raw == "0"   ~ "0 medications",
+      poly_cat_raw == "1–4" ~ "1–4 medications",
+      poly_cat_raw == "5–9" ~ "5–9 medications",
+      poly_cat_raw == "≥10" ~ "≥10 medications",
+      TRUE ~ poly_cat_raw
+    ),
+    # Ensure factor order matches the main plot (usually reference 1-4 first or ordered by risk)
+    # We maintain the same order as in the KM plot for consistency
+    poly_cat = factor(poly_cat, levels = c("1–4 medications", "0 medications", "5–9 medications", "≥10 medications"))
   )
 
-# 3) Create Risk Table Plot
-p_table <- ggplot(risk_tbl_df, aes(x = time, y = poly_cat, label = n.risk)) +
-  geom_text(size = 3.5) +
-  labs(x = "Years since interview", y = NULL) +
-  scale_x_continuous(breaks = risk_times) +
-  theme_minimal(base_size = 12) +
+# 4. Set Plot Parameters for Perfect Alignment
+#    We use the same X-axis limits and breaks for both
+x_limits <- c(0, 17) # Extend slightly past 16
+x_breaks <- table_times
+
+# 5. Build the Main KM Plot
+p_km <- ggplot(km_df, aes(x = time, y = surv, color = poly_cat)) +
+  geom_step(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+  scale_x_continuous(breaks = x_breaks, limits = x_limits) +
+  scale_color_brewer(palette = "Dark2") + # distinct colors
+  labs(
+    title = "Survey-weighted Kaplan–Meier survival",
+    x     = NULL, # Hide X label here, put it on table
+    y     = "Survival Probability",
+    color = "Medication Use"
+  ) +
+  theme_classic(base_size = 14) +
   theme(
-    panel.grid = element_blank(),
-    axis.text.y = element_text(face = "bold", hjust = 1)
+    legend.position = c(0.25, 0.35), # Place legend inside plot
+    legend.background = element_rect(fill = "white", color = "black"),
+    axis.text.x = element_blank(), # Hide x text (will be in table)
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(t=10, r=20, b=5, l=10)
   )
 
-# 4) Stack them
-# layout: KM plot on top (3 parts height), Table on bottom (1 part height)
-p_km / p_table + plot_layout(heights = c(4, 1))
+# 6. Build the Risk Table Plot
+p_table <- ggplot(risk_tbl_df, aes(x = time, y = poly_cat, label = scales::comma(n.risk))) +
+  geom_text(size = 4.5) +
+  scale_x_continuous(breaks = x_breaks, limits = x_limits) +
+  labs(x = "Years since interview", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text.y = element_text(face = "bold", hjust = 1, color = "black"),
+    axis.text.x = element_text(color = "black"),
+    panel.grid = element_blank(),
+    plot.margin = margin(t=0, r=20, b=10, l=10) # Align margins with top plot
+  )
 
-# design-based omnibus test (via Cox + regTermTest)
+# 7. Combine with Patchwork
+#    heights = c(3, 1) gives 75% height to plot, 25% to table
+combined_plot <- p_km / p_table + plot_layout(heights = c(3, 1))
+
+combined_plot
+
+# 8. Design-based omnibus test
 fit_lr  <- svycoxph(Surv(time_y, event) ~ poly_cat, design = dd_km)
 omni    <- regTermTest(fit_lr, ~ poly_cat)
 
@@ -449,7 +491,7 @@ knitr::kable(
 )
 ```
 
-\\newpage
+\newpage
 
 # **Missingness review (post-eligibility)**
 
@@ -536,7 +578,7 @@ knitr::kable(
 
 **Interpretation:** The logistic regression models reveal that missingness in both INDFMPIR and INSURED is systematically associated with observed demographic and health characteristics, rejecting the missing completely at random (MCAR) assumption. For INDFMPIR, we observe significant associations with age, race/ethnicity, education, insurance status, and healthcare utilization patterns. Similarly, insurance missingness varies significantly by age, race/ethnicity, education, and income level. These patterns support the missing at random (MAR) assumption, conditional on observed covariates, justifying our multiple imputation approach. We proceed with multiple imputation using all observed predictors, including a Nelson-Aalen cumulative hazard term to incorporate information from the survival outcome as recommended by White & Royston (2009).
 
-\\newpage
+\newpage
 
 # **Multiple imputation (indfmpir, insured) with Nelson–Aalen hazard**
 
@@ -643,7 +685,7 @@ imp <- mice(
 plot(imp, c("indfmpir","insured"))
 ```
 
-\\newpage
+\newpage
 
 # **Helper functions**
 
@@ -669,7 +711,7 @@ mk_indfmpir_cat <- function(x) {
 }
 ```
 
-\\newpage
+\newpage
 
 # **Main Cox models (crude & full)**
 
@@ -753,7 +795,7 @@ tbl_combined %>%
 
 ```
 
-\\newpage
+\newpage
 
 # **Cox model diagnostics: PH assumption & Multicollinearity**
 
@@ -871,7 +913,7 @@ knitr::kable(
 
 **Interpretation:** We assess multicollinearity using adjusted GVIF values. For categorical predictors, the adjusted GVIF (GVIF^(1/(2×Df))) provides a measure comparable to standard VIF for continuous variables. Values above 5 indicate severe multicollinearity, values between 2.5-5 suggest high multicollinearity, and values between 2-2.5 indicate moderate multicollinearity. Our results show that all adjusted GVIF values are within acceptable ranges (\< 5), indicating that multicollinearity is not a substantial concern in our model. Some moderate correlations among socioeconomic variables (education, income, insurance) are expected and do not compromise the validity of our estimates. The model's predictor structure is appropriate for drawing inferences about the association between polypharmacy and mortality.
 
-\\newpage
+\newpage
 
 # **Interaction models with therapeutic classes**
 
@@ -1138,60 +1180,79 @@ plot_dat <- purrr::imap_dfr(int_measures, function(obj, flag) {
 # -------------------------------------------------------------------
 # plot HRs for all combos & classes
 # -------------------------------------------------------------------
-# make nicer labels for the combos
-plot_dat_clean <- plot_dat %>%
+# Revised plotting logic: Y-axis = User/Non-User; Color = Polypharmacy Level
+plot_dat_revised <- plot_dat %>%
   dplyr::mutate(
-    combo_lbl = dplyr::case_when(
-      combo == "poly1_4_class0"  ~ "1–4 meds, Non-user",
-      combo == "poly1_4_class1"  ~ "1–4 meds, User",
-      combo == "poly5_9_class0"  ~ "5–9 meds, Non-user",
-      combo == "poly5_9_class1"  ~ "5–9 meds, User",
-      combo == "poly10p_class0"  ~ "≥10 meds, Non-user",
-      combo == "poly10p_class1"  ~ "≥10 meds, User",
-      TRUE ~ combo
+    # Extract User Status from the combo name (class1 = User, class0 = Non-user)
+    user_status = dplyr::case_when(
+      stringr::str_detect(combo, "class1") ~ "User",
+      stringr::str_detect(combo, "class0") ~ "Non-user",
+      TRUE ~ NA_character_
     ),
-    # Create clean names for the drug classes (for Facet Headers)
+    # Extract Polypharmacy Level
+    poly_group = dplyr::case_when(
+      stringr::str_detect(combo, "poly5_9") ~ "5–9 medications",
+      stringr::str_detect(combo, "poly10p") ~ "≥10 medications",
+      stringr::str_detect(combo, "poly1_4") ~ "1–4 medications",
+      TRUE ~ NA_character_
+    ),
+    # Create Label string: HR [LCL; UCL]
+    text_label = sprintf("%.2f [%.2f; %.2f]", HR, LCL, UCL),
+    # Clean Flag Names for Facet Titles
     flag_clean = dplyr::case_when(
       flag == "rx_antineoplastic" ~ "Antineoplastic Agents",
       flag == "rx_cns"            ~ "CNS Agents",
       flag == "rx_cardiovascular" ~ "Cardiovascular Agents",
       flag == "rx_psychotherapeutic" ~ "Psychotherapeutic Agents",
       TRUE ~ flag
-    ),
-    # order from lowest exposure to highest, and non-user before user
-    combo_lbl = factor(
-      combo_lbl,
-      levels = c(
-        "1–4 meds, Non-user",
-        "1–4 meds, User",
-        "5–9 meds, Non-user",
-        "5–9 meds, User",
-        "≥10 meds, Non-user",
-        "≥10 meds, User"
-      )
     )
+  ) %>%
+  # Filter: Keep only the high polypharmacy groups for the plot
+  dplyr::filter(poly_group %in% c("5–9 medications", "≥10 medications")) %>%
+  # Set factor levels for consistent plotting order
+  dplyr::mutate(
+    user_status = factor(user_status, levels = c("Non-user", "User")),
+    poly_group = factor(poly_group, levels = c("5–9 medications", "≥10 medications"))
   )
 
 # Faceted Plot by Therapeutic Class
-ggplot(plot_dat_clean,
-       aes(y = combo_lbl, x = HR, xmin = LCL, xmax = UCL, color = combo_lbl)) +
-  geom_pointrange(position = position_dodge(width = 0.6)) +
-  geom_vline(xintercept = 1, linetype = 2, color = "grey40") +
-  scale_x_log10(breaks = c(0.5, 1, 2, 4, 8)) +
+ggplot(plot_dat_revised,
+       aes(x = HR, y = user_status, color = poly_group, group = poly_group)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  
+  # Error bars and points with dodging
+  geom_errorbar(aes(xmin = LCL, xmax = UCL),
+                width = 0.2, position = position_dodge(width = 0.6), linewidth = 0.8) +
+  geom_point(position = position_dodge(width = 0.6), size = 2.5) +
+  
+  # Add text labels to the right of the error bar
+  geom_text(aes(x = UCL, label = text_label),
+            position = position_dodge(width = 0.6),
+            hjust = -0.15, size = 3, show.legend = FALSE) +
+  
+  facet_wrap(~ flag_clean, ncol = 2) +
+  
+  # Scales
+  scale_x_log10(breaks = c(0.5, 1, 2, 4, 8),
+                limits = c(0.2, 16)) + # Adjust limits to fit text labels
+  
+  # Labs
   labs(
-    title = "Hazard ratios for polypharmacy by therapeutic class",
-    subtitle = "Interaction models (0 medications excluded); Faceted by Class",
-    x     = "Hazard ratio (log scale)",
+    title = "Hazard ratios for polypharmacy by therapeutic class usage",
+    subtitle = "Interaction models (Reference: 1-4 meds, Non-user)",
+    x     = "Hazard Ratio (log scale)",
     y     = "",
-    color = "Medication Status"
+    color = "Medication Count"
   ) +
-  theme_minimal(base_size = 12) +
+  
+  # Theme
+  theme_classic(base_size = 14) +
   theme(
-    legend.position = "none",
+    legend.position = "bottom",
     strip.text = element_text(face = "bold", size = 11),
-    panel.grid.minor = element_blank()
-  ) +
-  facet_wrap(~ flag_clean, scales = "free_y", ncol = 2)
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "bold")
+  )
 
 # RERI / multiplicative table
 #--------------------------------------------------
@@ -1203,7 +1264,7 @@ reri_tbl <- purrr::imap_dfr(int_measures, ~{
 reri_tbl
 ```
 
-\\newpage
+\newpage
 
 # **Sensitivity: continuous medication count with spline**
 
@@ -1346,7 +1407,7 @@ ggplot2::ggplot(pred_df, aes(x = rxdcount, y = HR)) +
   ggplot2::theme(panel.grid.minor = element_blank())
 ```
 
-\\newpage
+\newpage
 
 # **Sensitivity: restrict to higher multimorbidity thresholds**
 
@@ -1450,7 +1511,7 @@ ggplot(mm_plot,
     )
 ```
 
-\\newpage
+\newpage
 
 # **Sensitivity: censor follow-up at 5 and 10 years**
 
@@ -1529,7 +1590,7 @@ fit_10yr <- with(imp, {
 })
 ```
 
-\\newpage
+\newpage
 
 # **Sensitivity: remove anti-biotics from the prescription medication count**
 
@@ -1562,7 +1623,7 @@ fit_noabx <- with(imp, {
 
 ```
 
-\\newpage
+\newpage
 
 # **Grand forest plot (main + censoring + multimorbidity)**
 
@@ -1650,7 +1711,7 @@ for(m in model_list) {
 # Bind everything together
 df_viz <- bind_rows(final_df_list)
 
-# 4. Add the absolute top header (like the example's "Exposure / OR (CI)")
+# 4. Add the absolute top header 
 # Note: In the example, this was row 1.
 top_header <- tibble(
   model = "Header",
